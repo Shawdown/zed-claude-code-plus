@@ -1319,6 +1319,15 @@ impl AcpConnection {
         self.agent_capabilities.session_capabilities.close.is_some()
     }
 
+    fn claude_code_plus_capability(&self, name: &str) -> Option<&serde_json::Value> {
+        self.agent_capabilities
+            .meta
+            .as_ref()?
+            .get(CLAUDE_CODE_PLUS_META_KEY)?
+            .get(name)
+            .filter(|capability| capability.is_object())
+    }
+
     fn open_or_create_session(
         self: Rc<Self>,
         session_id: acp_v2::SessionId,
@@ -2098,59 +2107,43 @@ impl AgentConnection for AcpConnection {
         params: acp_v2::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
-        let session_id = params.session_id.clone();
-        let params = match acp_thread::content::prompt_to_v1(params) {
-            Ok(params) => params,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let conn = self.connection.clone();
-        let sessions = self.sessions.clone();
-        cx.foreground_executor().spawn(async move {
-            let result = conn.send_request(params).block_task().await;
+        send_prompt(
+            self.connection.clone(),
+            self.sessions.clone(),
+            params,
+            None,
+            cx,
+        )
+    }
 
-            let mut suppress_abort_err = false;
+    fn client_user_message_ids(
+        &self,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionClientUserMessageIds>> {
+        self.claude_code_plus_capability("clientUserMessageIds")?;
+        Some(Rc::new(AcpClientUserMessageIds {
+            connection: self.connection.clone(),
+            sessions: self.sessions.clone(),
+        }))
+    }
 
-            if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
-                suppress_abort_err = session.suppress_abort_err;
-                session.suppress_abort_err = false;
-            }
-
-            match result {
-                Ok(response) => Ok(response),
-                Err(err) => {
-                    if err.code != ErrorCode::InternalError {
-                        anyhow::bail!(err)
-                    }
-
-                    let Some(data) = &err.data else {
-                        anyhow::bail!(err)
-                    };
-
-                    // Temporary workaround until the following PR is generally available:
-                    // https://github.com/google-gemini/gemini-cli/pull/6656
-
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct ErrorDetails {
-                        details: Box<str>,
-                    }
-
-                    match serde_json::from_value(data.clone()) {
-                        Ok(ErrorDetails { details }) => {
-                            if suppress_abort_err
-                                && (details.contains("This operation was aborted")
-                                    || details.contains("The user aborted a request"))
-                            {
-                                Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
-                            } else {
-                                Err(anyhow!(details))
-                            }
-                        }
-                        Err(_) => Err(anyhow!(err)),
-                    }
-                }
-            }
-        })
+    fn truncate(
+        &self,
+        session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionTruncate>> {
+        self.claude_code_plus_capability("clientUserMessageIds")?;
+        let capability = self.claude_code_plus_capability("truncate")?;
+        let method = capability
+            .get("method")
+            .and_then(|method| method.as_str())
+            .unwrap_or(DEFAULT_TRUNCATE_METHOD)
+            .to_string();
+        Some(Rc::new(AcpSessionTruncate {
+            connection: self.connection.clone(),
+            session_id: session_id.clone(),
+            method,
+        }))
     }
 
     fn cancel(&self, session_id: &acp_v2::SessionId, _cx: &mut App) {
@@ -2210,6 +2203,128 @@ impl AgentConnection for AcpConnection {
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
+    }
+}
+
+const CLAUDE_CODE_PLUS_META_KEY: &str = "claudeCodePlus";
+const DEFAULT_TRUNCATE_METHOD: &str = "_claudeCodePlus/truncate";
+
+fn send_prompt(
+    conn: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+    params: acp_v2::PromptRequest,
+    client_user_message_id: Option<acp_thread::ClientUserMessageId>,
+    cx: &mut App,
+) -> Task<Result<acp::PromptResponse>> {
+    let session_id = params.session_id.clone();
+    let mut params = match acp_thread::content::prompt_to_v1(params) {
+        Ok(params) => params,
+        Err(error) => return Task::ready(Err(error)),
+    };
+    if let Some(client_user_message_id) = client_user_message_id {
+        params.meta.get_or_insert_default().insert(
+            CLAUDE_CODE_PLUS_META_KEY.to_string(),
+            serde_json::json!({ "clientUserMessageId": client_user_message_id.as_str() }),
+        );
+    }
+    cx.foreground_executor().spawn(async move {
+        let result = conn.send_request(params).block_task().await;
+
+        let mut suppress_abort_err = false;
+
+        if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
+            suppress_abort_err = session.suppress_abort_err;
+            session.suppress_abort_err = false;
+        }
+
+        match result {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                if err.code != ErrorCode::InternalError {
+                    anyhow::bail!(err)
+                }
+
+                let Some(data) = &err.data else {
+                    anyhow::bail!(err)
+                };
+
+                // Temporary workaround until the following PR is generally available:
+                // https://github.com/google-gemini/gemini-cli/pull/6656
+
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ErrorDetails {
+                    details: Box<str>,
+                }
+
+                match serde_json::from_value(data.clone()) {
+                    Ok(ErrorDetails { details }) => {
+                        if suppress_abort_err
+                            && (details.contains("This operation was aborted")
+                                || details.contains("The user aborted a request"))
+                        {
+                            Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+                        } else {
+                            Err(anyhow!(details))
+                        }
+                    }
+                    Err(_) => Err(anyhow!(err)),
+                }
+            }
+        }
+    })
+}
+
+struct AcpClientUserMessageIds {
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+}
+
+impl acp_thread::AgentSessionClientUserMessageIds for AcpClientUserMessageIds {
+    fn prompt(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
+        params: acp_v2::PromptRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        send_prompt(
+            self.connection.clone(),
+            self.sessions.clone(),
+            params,
+            Some(client_user_message_id),
+            cx,
+        )
+    }
+}
+
+struct AcpSessionTruncate {
+    connection: ConnectionTo<Agent>,
+    session_id: acp_v2::SessionId,
+    method: String,
+}
+
+impl acp_thread::AgentSessionTruncate for AcpSessionTruncate {
+    fn run(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let request = UntypedMessage::new(
+            &self.method,
+            serde_json::json!({
+                "sessionId": self.session_id.0.as_ref(),
+                "clientUserMessageId": client_user_message_id.as_str(),
+            }),
+        );
+        let conn = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let request = request.map_err(map_acp_error)?;
+            conn.send_request(request)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            Ok(())
+        })
     }
 }
 

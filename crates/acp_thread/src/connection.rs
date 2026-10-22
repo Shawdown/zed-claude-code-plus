@@ -22,6 +22,14 @@ impl ClientUserMessageId {
         Self(Uuid::new_v4().to_string().into())
     }
 
+    pub fn from_existing(id: impl Into<SharedString>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+
     pub fn message_id(&self) -> acp_v2::MessageId {
         acp_v2::MessageId::new(self.0.as_ref())
     }
