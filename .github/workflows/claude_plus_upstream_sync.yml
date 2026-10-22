@@ -1,0 +1,121 @@
+name: claude_plus_upstream_sync
+on:
+  schedule:
+  - cron: 17 6 * * *
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+concurrency:
+  group: claude-plus-upstream-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+      HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+      UPSTREAM: zed-industries/zed
+      BASE: claude-plus
+    steps:
+    - name: Find latest stable upstream release
+      id: upstream
+      run: |
+        tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+        echo "Latest stable upstream release: $tag"
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ env.BASE }}
+        fetch-depth: 0
+        filter: blob:none
+        token: ${{ secrets.SYNC_TOKEN || github.token }}
+    - name: Check whether the release is already merged
+      id: check
+      env:
+        TAG: ${{ steps.upstream.outputs.tag }}
+      run: |
+        git fetch --no-tags --filter=blob:none "https://github.com/$UPSTREAM.git" "refs/tags/$TAG:refs/tags/$TAG"
+        if git merge-base --is-ancestor "$TAG" HEAD; then
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "$TAG is already part of $BASE"
+        else
+          echo "merged=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Merge release into a sync branch
+      id: merge
+      if: steps.check.outputs.merged == 'false'
+      env:
+        TAG: ${{ steps.upstream.outputs.tag }}
+        VERSION: ${{ steps.upstream.outputs.version }}
+      run: |
+        branch="upstream-sync/$TAG"
+        echo "branch=$branch" >> "$GITHUB_OUTPUT"
+        if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git checkout -b "$branch"
+        if git merge --no-ff --no-edit -m "Merge upstream Zed $TAG" "$TAG"; then
+          echo "$VERSION-plus.1" > .github/claude-plus/VERSION
+          git add .github/claude-plus/VERSION
+          git commit -m "Bump Claude Code Plus build to $VERSION-plus.1"
+          echo "clean=true" >> "$GITHUB_OUTPUT"
+        else
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+          git merge --abort
+          echo "clean=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Open pull request
+      if: steps.merge.outputs.clean == 'true' && env.HAS_SYNC_TOKEN == 'true'
+      env:
+        TAG: ${{ steps.upstream.outputs.tag }}
+        BRANCH: ${{ steps.merge.outputs.branch }}
+      run: |
+        git push -u origin "$BRANCH"
+        gh pr create --base "$BASE" --head "$BRANCH" \
+          --title "Merge upstream Zed $TAG" \
+          --body "Merges https://github.com/$UPSTREAM/releases/tag/$TAG into \`$BASE\` without conflicts and bumps \`.github/claude-plus/VERSION\`, so merging this builds and publishes a new Windows release."
+    - name: Open issue
+      if: steps.check.outputs.merged == 'false' && steps.merge.outputs.exists != 'true' && (steps.merge.outputs.clean == 'false' || env.HAS_SYNC_TOKEN != 'true')
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ steps.upstream.outputs.tag }}
+        VERSION: ${{ steps.upstream.outputs.version }}
+        CLEAN: ${{ steps.merge.outputs.clean }}
+      run: |
+        title="Upstream Zed $TAG is available"
+        if [ -n "$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[].number')" ]; then
+          echo "Issue already open"
+          exit 0
+        fi
+        {
+          echo "Zed [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) is out and not yet merged into \`$BASE\`."
+          echo
+          if [ "$CLEAN" = "true" ]; then
+            echo "It merges cleanly. Add a \`SYNC_TOKEN\` secret (a fine-grained token with Contents, Pull requests and Workflows write access) to have this workflow open the pull request automatically."
+          else
+            echo "The merge has conflicts in:"
+            echo
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+          fi
+          echo
+          echo "Merge locally:"
+          echo
+          echo '```sh'
+          echo "git fetch https://github.com/$UPSTREAM.git tag $TAG --no-tags"
+          echo "git checkout $BASE"
+          echo "git merge $TAG"
+          echo "echo $VERSION-plus.1 > .github/claude-plus/VERSION"
+          echo "git commit -am \"Bump Claude Code Plus build to $VERSION-plus.1\""
+          echo "git push origin $BASE"
+          echo '```'
+          echo
+          echo "Pushing the version bump builds and publishes the Windows release."
+        } > body.md
+        gh issue create --title "$title" --body-file body.md

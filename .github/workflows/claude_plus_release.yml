@@ -1,0 +1,110 @@
+name: claude_plus_release
+on:
+  push:
+    branches:
+    - claude-plus
+    paths:
+    - .github/claude-plus/VERSION
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: claude-plus-release
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: '1'
+jobs:
+  bundle_windows_x86_64:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+    - name: Enable long paths
+      run: git config --system core.longpaths true
+      shell: pwsh
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Read version
+      id: version
+      run: |
+        $version = (Get-Content .github/claude-plus/VERSION -Raw).Trim()
+        "version=$version" >> $env:GITHUB_OUTPUT
+      shell: pwsh
+    - name: Expose Visual Studio at the path the bundle script expects
+      run: |
+        $installPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+        $expected = "C:\Program Files\Microsoft Visual Studio\2022\Community"
+        if (-not (Test-Path $expected)) {
+          New-Item -ItemType Junction -Path $expected -Target $installPath | Out-Null
+        }
+      shell: pwsh
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-registry-
+    - name: Bundle
+      run: script/bundle-windows.ps1 -Architecture x86_64
+      shell: pwsh
+      env:
+        CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+    - name: Rename installer
+      run: |
+        Move-Item target/Zed-x86_64.exe "target/Zed-Claude-Code-Plus-${{ steps.version.outputs.version }}-x86_64.exe"
+      shell: pwsh
+    - name: Upload installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: Zed-Claude-Code-Plus-${{ steps.version.outputs.version }}-x86_64
+        path: target/Zed-Claude-Code-Plus-${{ steps.version.outputs.version }}-x86_64.exe
+        if-no-files-found: error
+    - name: Upload remote server
+      uses: actions/upload-artifact@v4
+      with:
+        name: zed-remote-server-windows-x86_64
+        path: target/zed-remote-server-windows-x86_64.zip
+        if-no-files-found: error
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+  publish_release:
+    needs: bundle_windows_x86_64
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+        merge-multiple: true
+    - name: Create release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ needs.bundle_windows_x86_64.outputs.version }}
+      run: |
+        cat > notes.md <<NOTES
+        Zed ${VERSION%%-plus*} with Claude Code Plus additions, built from \`${GITHUB_SHA::7}\`.
+
+        ### Install (Windows 11, x64)
+        1. Download \`Zed-Claude-Code-Plus-${VERSION}-x86_64.exe\` and run it. It installs over the official Zed and keeps your settings, extensions and threads.
+        2. The installer is unsigned, so SmartScreen may warn: choose **More info → Run anyway**.
+        3. Make sure \`"auto_update": false\` is in your settings.json (it is the default in this build), otherwise Zed will replace it with the official release.
+
+        ### Additions
+        - Editing previous messages for agents that advertise \`claudeCodePlus\` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
+        - \`agent.wrap_terminal_commands\` setting and a hover button on command blocks to toggle wrapping.
+        NOTES
+        gh release create "v${VERSION}" dist/* \
+          --repo "$GITHUB_REPOSITORY" \
+          --target "$GITHUB_SHA" \
+          --title "Zed Claude Code Plus ${VERSION}" \
+          --notes-file notes.md
