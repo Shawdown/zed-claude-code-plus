@@ -71,7 +71,7 @@ jobs:
           git merge --abort
           echo "clean=false" >> "$GITHUB_OUTPUT"
         fi
-    - name: Open pull request
+    - name: Open and merge pull request
       if: steps.merge.outputs.clean == 'true' && env.HAS_SYNC_TOKEN == 'true'
       env:
         TAG: ${{ steps.upstream.outputs.tag }}
@@ -81,6 +81,7 @@ jobs:
         gh pr create --base "$BASE" --head "$BRANCH" \
           --title "Merge upstream Zed $TAG" \
           --body "Merges https://github.com/$UPSTREAM/releases/tag/$TAG into \`$BASE\` without conflicts and bumps \`.github/claude-plus/VERSION\`, so merging this builds and publishes a new Windows release."
+        gh pr merge "$BRANCH" --merge --delete-branch
     - name: Open issue
       if: steps.check.outputs.merged == 'false' && steps.merge.outputs.exists != 'true' && (steps.merge.outputs.clean == 'false' || env.HAS_SYNC_TOKEN != 'true')
       env:
@@ -98,7 +99,7 @@ jobs:
           echo "Zed [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) is out and not yet merged into \`$BASE\`."
           echo
           if [ "$CLEAN" = "true" ]; then
-            echo "It merges cleanly. Add a \`SYNC_TOKEN\` secret (a fine-grained token with Contents, Pull requests and Workflows write access) to have this workflow open the pull request automatically."
+            echo "It merges cleanly. Add a \`SYNC_TOKEN\` secret (a fine-grained token with Contents, Pull requests and Workflows write access) to have this workflow merge it automatically."
           else
             echo "The merge has conflicts in:"
             echo
