@@ -81,11 +81,17 @@ jobs:
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     steps:
+    - name: Checkout installer script
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: script/claude-plus
     - name: Download artifacts
       uses: actions/download-artifact@v4
       with:
         path: dist
         merge-multiple: true
+    - name: Add installer script
+      run: cp script/claude-plus/install.cmd dist/install-zed-claude-code-plus.cmd
     - name: Create release
       env:
         GH_TOKEN: ${{ github.token }}
@@ -95,13 +101,14 @@ jobs:
         Zed ${VERSION%%-plus*} with Claude Code Plus additions, built from \`${GITHUB_SHA::7}\`.
 
         ### Install (Windows 11, x64)
-        1. Download \`Zed-Claude-Code-Plus-${VERSION}-x86_64.exe\` and run it. It installs over the official Zed and keeps your settings, extensions and threads.
-        2. The installer is unsigned, so SmartScreen may warn: choose **More info → Run anyway**.
+        1. Download \`install-zed-claude-code-plus.cmd\` once and double-click it. It uses the GitHub CLI (\`gh\`) to download and install the latest release, so running it again later updates Zed. Alternatively, download \`Zed-Claude-Code-Plus-${VERSION}-x86_64.exe\` and run it.
+        2. The installer replaces the official Zed and keeps your settings, extensions and threads. It is unsigned, so SmartScreen may warn when you run a downloaded file: choose **More info → Run anyway**.
         3. Make sure \`"auto_update": false\` is in your settings.json (it is the default in this build), otherwise Zed will replace it with the official release.
 
         ### Additions
         - Editing previous messages for agents that advertise \`claudeCodePlus\` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
         - \`agent.wrap_terminal_commands\` setting and a hover button on command blocks to toggle wrapping.
+        - \`/clear\`, \`/reset\` and \`/new\` open a new thread for the same agent when it advertises \`newThreadCommands\` (claude-agent-acp-plus 0.94.0-plus.8+).
         NOTES
         gh release create "v${VERSION}" dist/* \
           --repo "$GITHUB_REPOSITORY" \
