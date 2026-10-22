@@ -377,6 +377,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub cancel_generation_on_terminal_stop: Option<bool>,
+    /// Whether commands run by terminal tools are soft-wrapped in the agent panel.
+    /// When disabled, long commands scroll horizontally instead.
+    ///
+    /// Default: true
+    pub wrap_terminal_commands: Option<bool>,
     /// Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages in the agent panel.
     ///
     /// Default: false

@@ -1099,6 +1099,7 @@ mod tests {
             expand_terminal_card: true,
             terminal_init_command: None,
             cancel_generation_on_terminal_stop: true,
+            wrap_terminal_commands: true,
             use_modifier_to_send: true,
             message_editor_min_lines: 1,
             tool_permissions: Default::default(),

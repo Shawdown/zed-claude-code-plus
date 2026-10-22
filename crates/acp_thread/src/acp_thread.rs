@@ -4766,8 +4766,6 @@ impl AcpThread {
         chunk: acp_v2::ContentBlock,
         cx: &mut Context<Self>,
     ) {
-        // Replayed messages carry the agent's own id, which agents that accept
-        // client ids also accept for truncation, so loaded history stays editable.
         let client_id = id
             .as_ref()
             .filter(|_| self.connection.client_user_message_ids(cx).is_some())

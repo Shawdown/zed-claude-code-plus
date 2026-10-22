@@ -1394,6 +1394,11 @@
     //
     // Default: true
     "cancel_generation_on_terminal_stop": true,
+    // Whether commands run by terminal tools are soft-wrapped in the agent panel.
+    // When disabled, long commands scroll horizontally instead.
+    //
+    // Default: true
+    "wrap_terminal_commands": true,
     // Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages in the agent panel.
     //
     // Default: false

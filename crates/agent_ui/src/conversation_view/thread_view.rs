@@ -8453,7 +8453,11 @@ impl ThreadView {
         // lines don't pick up the code block's left padding. Wrap mode lays the
         // text out as a normal block inside the padded content box, so every
         // line (wrapped or not) is padded consistently.
-        style.code_block_overflow_x_scroll = false;
+        let wrap_commands = AgentSettings::get_global(cx).wrap_terminal_commands;
+        style.code_block_overflow_x_scroll = !wrap_commands;
+        if !wrap_commands {
+            style.code_block.text.white_space = Some(gpui::WhiteSpace::Nowrap);
+        }
 
         let header_bg = self.tool_card_header_bg(cx);
         let run_command_label = if is_preview {
@@ -8482,6 +8486,29 @@ impl ThreadView {
         let copy_button = CopyButton::new(copy_button_id, command_text)
             .tooltip_label("Copy Command")
             .visible_on_hover(group.clone());
+        let (wrap_icon, wrap_tooltip) = if wrap_commands {
+            (IconName::TextUnwrap, "Unwrap Commands")
+        } else {
+            (IconName::TextWrap, "Wrap Commands")
+        };
+        let wrap_button = IconButton::new(
+            SharedString::from(format!("{group}-wrap-command")),
+            wrap_icon,
+        )
+        .icon_size(IconSize::Small)
+        .icon_color(Color::Muted)
+        .tooltip(Tooltip::text(wrap_tooltip))
+        .visible_on_hover(group.clone())
+        .on_click(cx.listener(move |this, _event, _window, cx| {
+            let fs = this.thread.read(cx).project().read(cx).fs().clone();
+            update_settings_file(fs, cx, move |settings, _| {
+                settings
+                    .agent
+                    .get_or_insert_default()
+                    .wrap_terminal_commands = Some(!wrap_commands);
+            });
+            cx.notify();
+        }));
 
         v_flex()
             .group(group)
@@ -8490,7 +8517,15 @@ impl ThreadView {
             .bg(header_bg)
             .when(is_preview, |this| this.pt_1().children(run_command_label))
             .child(markdown_element)
-            .child(div().absolute().top_1().right_1().child(copy_button))
+            .child(
+                h_flex()
+                    .absolute()
+                    .top_1()
+                    .right_1()
+                    .gap_0p5()
+                    .child(wrap_button)
+                    .child(copy_button),
+            )
     }
 
     fn render_terminal_tool_call(

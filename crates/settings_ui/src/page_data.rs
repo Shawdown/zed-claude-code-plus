@@ -9196,6 +9196,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Wrap Terminal Commands",
+                description: "Whether commands run by terminal tools are soft-wrapped in the agent panel. When disabled, long commands scroll horizontally instead.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.wrap_terminal_commands"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .wrap_terminal_commands
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .wrap_terminal_commands = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Use Modifier To Send",
                 description: "Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages.",
                 field: Box::new(SettingField {
