@@ -61,7 +61,28 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git checkout -b "$branch"
+        clean=false
         if git merge --no-ff --no-edit -m "Merge upstream Zed $TAG" "$TAG"; then
+          clean=true
+        else
+          for path in $(git diff --name-only --diff-filter=U); do
+            case "$path" in
+              .rules|.agents/skills/zed-cherry-pick/*|.factory/prompts/crash/*)
+                if git cat-file -e "HEAD:$path" 2>/dev/null; then
+                  git checkout --ours -- "$path"
+                  git add -- "$path"
+                else
+                  git rm --quiet -- "$path"
+                fi
+                ;;
+            esac
+          done
+          if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+            git commit --no-edit
+            clean=true
+          fi
+        fi
+        if [ "$clean" = "true" ]; then
           echo "$VERSION-plus.1" > .github/claude-plus/VERSION
           git add .github/claude-plus/VERSION
           git commit -m "Bump Claude Code Plus build to $VERSION-plus.1"
