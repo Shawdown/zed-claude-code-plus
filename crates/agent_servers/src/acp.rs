@@ -2146,6 +2146,17 @@ impl AgentConnection for AcpConnection {
         }))
     }
 
+    fn starts_new_thread_for_command(&self, command_name: &str) -> bool {
+        self.claude_code_plus_capability("newThreadCommands")
+            .and_then(|capability| capability.get("commands"))
+            .and_then(|commands| commands.as_array())
+            .is_some_and(|commands| {
+                commands
+                    .iter()
+                    .any(|command| command.as_str() == Some(command_name))
+            })
+    }
+
     fn cancel(&self, session_id: &acp_v2::SessionId, _cx: &mut App) {
         if let Some(session) = self.sessions.borrow_mut().get_mut(session_id) {
             session.suppress_abort_err = true;

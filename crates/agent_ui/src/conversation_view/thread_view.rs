@@ -1826,14 +1826,30 @@ impl ThreadView {
             return;
         }
 
+        let text = message_editor.read(cx).text(cx);
+        let text = text.trim();
+        if let Some(command_name) = text.strip_prefix('/')
+            && thread
+                .read(cx)
+                .connection()
+                .starts_new_thread_for_command(command_name)
+        {
+            message_editor.update(cx, |editor, cx| editor.clear(window, cx));
+            window.dispatch_action(
+                Box::new(crate::NewExternalAgentThread {
+                    agent: self.agent_id.clone(),
+                }),
+                cx,
+            );
+            return;
+        }
+
         if is_generating {
             cx.emit(AcpThreadViewEvent::Interacted);
             self.queue_message(message_editor, window, cx);
             return;
         }
 
-        let text = message_editor.read(cx).text(cx);
-        let text = text.trim();
         if text == "/login" || text == "/logout" {
             let connection = thread.read(cx).connection().clone();
             let can_login = connection

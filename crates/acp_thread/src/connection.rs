@@ -251,6 +251,10 @@ pub trait AgentConnection {
         None
     }
 
+    fn starts_new_thread_for_command(&self, _command_name: &str) -> bool {
+        false
+    }
+
     fn set_title(
         &self,
         _session_id: &acp_v2::SessionId,
