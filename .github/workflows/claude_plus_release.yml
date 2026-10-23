@@ -15,7 +15,7 @@ permissions:
   contents: write
 concurrency:
   group: claude-plus-release
-  cancel-in-progress: false
+  cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
