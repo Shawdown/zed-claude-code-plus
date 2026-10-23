@@ -47,6 +47,11 @@ impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
+const CLAUDE_PLUS_REPOSITORY: &str = "Shawdown/zed-claude-code-plus";
+
+pub fn claude_plus_version() -> Option<Version> {
+    option_env!("ZED_CLAUDE_PLUS_VERSION").and_then(|version| version.parse().ok())
+}
 
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
@@ -195,6 +200,18 @@ pub struct ReleaseAsset {
     pub url: String,
 }
 
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
 struct MacOsUnmounter<'a> {
     mount_path: PathBuf,
     background_executor: &'a BackgroundExecutor,
@@ -274,7 +291,7 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     })
     .detach();
 
-    let version = release_channel::AppVersion::global(cx);
+    let version = claude_plus_version().unwrap_or_else(|| release_channel::AppVersion::global(cx));
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
@@ -346,6 +363,11 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
     let release_channel = ReleaseChannel::try_global(cx)?;
     let url = match release_channel {
         ReleaseChannel::Stable | ReleaseChannel::Preview => {
+            if let Some(version) = claude_plus_version() {
+                return Some(format!(
+                    "https://github.com/{CLAUDE_PLUS_REPOSITORY}/releases/tag/v{version}"
+                ));
+            }
             let auto_updater = AutoUpdater::get(cx)?;
             let auto_updater = auto_updater.read(cx);
             let mut current_version = auto_updater.current_version.clone();
@@ -737,6 +759,62 @@ impl AutoUpdater {
         })
     }
 
+    async fn get_claude_plus_release_asset(
+        client: &HttpClientWithUrl,
+        os: &str,
+        arch: &str,
+    ) -> Result<ReleaseAsset> {
+        let url = format!("https://api.github.com/repos/{CLAUDE_PLUS_REPOSITORY}/releases/latest");
+        let mut response = client.get(&url, Default::default(), true).await?;
+        let mut body = Vec::new();
+        response.body_mut().read_to_end(&mut body).await?;
+
+        anyhow::ensure!(
+            response.status().is_success(),
+            "failed to fetch the latest Claude Code Plus release: {:?}",
+            String::from_utf8_lossy(&body),
+        );
+
+        let release: GithubRelease =
+            serde_json::from_slice(body.as_slice()).with_context(|| {
+                format!(
+                    "error deserializing release {:?}",
+                    String::from_utf8_lossy(&body),
+                )
+            })?;
+
+        let extension = match os {
+            "windows" => ".exe",
+            "macos" => ".dmg",
+            "linux" => ".tar.gz",
+            unsupported_os => anyhow::bail!("not supported: {unsupported_os}"),
+        };
+        let asset_suffix = format!("-{arch}{extension}");
+        let asset = release
+            .assets
+            .into_iter()
+            .find(|asset| {
+                asset.name.starts_with("Zed-Claude-Code-Plus-")
+                    && asset.name.ends_with(&asset_suffix)
+            })
+            .with_context(|| {
+                format!(
+                    "release {} has no installer for {os} {arch}",
+                    release.tag_name
+                )
+            })?;
+        let version = release
+            .tag_name
+            .strip_prefix('v')
+            .unwrap_or(&release.tag_name)
+            .to_string();
+
+        Ok(ReleaseAsset {
+            version,
+            url: asset.browser_download_url,
+        })
+    }
+
     async fn update(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let (client, installed_version, previous_status, release_channel) =
             this.read_with(cx, |this, cx| {
@@ -756,8 +834,7 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
+        let fetched_release_data = Self::get_claude_plus_release_asset(&client, OS, ARCH).await?;
         let fetched_version = fetched_release_data.clone().version;
         let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
         let newer_version = Self::check_if_fetched_version_is_newer(
@@ -961,8 +1038,6 @@ impl AutoUpdater {
         mut installed_version: Version,
         fetched_version: Version,
     ) -> Option<Version> {
-        // For non-nightly releases, ignore build and pre-release fields as they're not provided by our endpoints right now.
-        installed_version.pre = semver::Prerelease::EMPTY;
         installed_version.build = semver::BuildMetadata::EMPTY;
         (fetched_version > installed_version).then_some(fetched_version)
     }
@@ -1384,7 +1459,7 @@ mod tests {
     impl Global for InstallOverride {}
 
     #[gpui::test]
-    fn test_auto_update_defaults_to_false(cx: &mut TestAppContext) {
+    fn test_auto_update_defaults_to_true(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let mut store = SettingsStore::new(cx, &settings::default_settings());
             store
@@ -1394,7 +1469,7 @@ mod tests {
                 .set_user_settings("{}", cx)
                 .expect("Unable to set user settings");
             cx.set_global(store);
-            assert!(!AutoUpdateSetting::get_global(cx).0);
+            assert!(AutoUpdateSetting::get_global(cx).0);
         });
     }
 
@@ -1419,16 +1494,29 @@ mod tests {
                 let release_available = release_available.load(atomic::Ordering::Relaxed);
                 let dmg_rx = dmg_rx.clone();
                 async move {
-                if req.uri().path() == "/releases/stable/latest/asset" {
-                    if release_available {
-                        return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.1","url":"https://test.example/new-download"}"#.into()
-                        ).unwrap());
+                if req.uri().path() == "/repos/Shawdown/zed-claude-code-plus/releases/latest" {
+                    let (version, download_url) = if release_available {
+                        ("0.100.1", "https://test.example/new-download")
                     } else {
-                        return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.0","url":"https://test.example/old-download"}"#.into()
-                        ).unwrap());
-                    }
+                        ("0.100.0", "https://test.example/old-download")
+                    };
+                    let extension = match OS {
+                        "windows" => ".exe",
+                        "macos" => ".dmg",
+                        _ => ".tar.gz",
+                    };
+                    let release = serde_json::json!({
+                        "tag_name": format!("v{version}"),
+                        "assets": [
+                            {
+                                "name": format!("Zed-Claude-Code-Plus-{version}-{ARCH}{extension}"),
+                                "browser_download_url": download_url,
+                            }
+                        ],
+                    });
+                    return Ok(Response::builder().status(200).body(
+                        release.to_string().into()
+                    ).unwrap());
                 } else if req.uri().path() == "/new-download" {
                     return Ok(Response::builder().status(200).body({
                         let dmg_rx = dmg_rx.lock().take().unwrap();

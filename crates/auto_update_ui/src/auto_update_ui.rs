@@ -96,7 +96,8 @@ fn view_release_notes_locally(
     if matches!(
         release_channel,
         ReleaseChannel::Nightly | ReleaseChannel::Dev
-    ) {
+    ) || auto_update::claude_plus_version().is_some()
+    {
         if let Some(url) = release_notes_url(cx) {
             cx.open_url(&url);
         }
@@ -306,7 +307,8 @@ fn show_update_notification(cx: &mut App) {
         return;
     };
 
-    let mut version = updater.read(cx).current_version();
+    let installed_version = updater.read(cx).current_version();
+    let mut version = installed_version.clone();
     version.pre = semver::Prerelease::EMPTY;
     version.build = semver::BuildMetadata::EMPTY;
     let app_name = ReleaseChannel::global(cx).display_name();
@@ -324,17 +326,20 @@ fn show_update_notification(cx: &mut App) {
             move |cx| {
                 let workspace_handle = cx.entity().downgrade();
                 cx.new(|cx| {
-                    MessageNotification::new(format!("Updated to {app_name} {}", version), cx)
-                        .primary_message("View Release Notes")
-                        .primary_on_click(move |window, cx| {
-                            if let Some(workspace) = workspace_handle.upgrade() {
-                                workspace.update(cx, |workspace, cx| {
-                                    crate::view_release_notes_locally(workspace, window, cx);
-                                })
-                            }
-                            cx.emit(DismissEvent);
-                        })
-                        .show_suppress_button(false)
+                    MessageNotification::new(
+                        format!("Updated to {app_name} {installed_version}"),
+                        cx,
+                    )
+                    .primary_message("View Release Notes")
+                    .primary_on_click(move |window, cx| {
+                        if let Some(workspace) = workspace_handle.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                crate::view_release_notes_locally(workspace, window, cx);
+                            })
+                        }
+                        cx.emit(DismissEvent);
+                    })
+                    .show_suppress_button(false)
                 })
             },
         );
