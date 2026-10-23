@@ -11,8 +11,13 @@ on:
         description: Publish a GitHub release
         type: boolean
         default: false
+      artifacts_run_id:
+        description: Publish the artifacts of this earlier run instead of building
+        type: string
+        default: ''
 permissions:
   contents: write
+  actions: read
 concurrency:
   group: claude-plus-release
   cancel-in-progress: true
@@ -22,6 +27,7 @@ env:
   RUST_BACKTRACE: '1'
 jobs:
   bundle_windows_x86_64:
+    if: inputs.artifacts_run_id == ''
     runs-on: windows-2022
     timeout-minutes: 360
     steps:
@@ -79,25 +85,30 @@ jobs:
       version: ${{ steps.version.outputs.version }}
   publish_release:
     needs: bundle_windows_x86_64
-    if: github.event_name == 'push' || inputs.publish
-    runs-on: ubuntu-latest
+    if: always() && (needs.bundle_windows_x86_64.result == 'success' || (needs.bundle_windows_x86_64.result == 'skipped' && inputs.artifacts_run_id != '')) && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
     steps:
     - name: Checkout installer script
       uses: actions/checkout@v4
       with:
-        sparse-checkout: script/claude-plus
+        sparse-checkout: |
+          script/claude-plus
+          .github/claude-plus
     - name: Download artifacts
       uses: actions/download-artifact@v4
       with:
         path: dist
         merge-multiple: true
+        run-id: ${{ inputs.artifacts_run_id || github.run_id }}
+        github-token: ${{ github.token }}
     - name: Add installer script
       run: cp script/claude-plus/install.cmd dist/install-zed-claude-code-plus.cmd
     - name: Create release
       env:
         GH_TOKEN: ${{ github.token }}
-        VERSION: ${{ needs.bundle_windows_x86_64.outputs.version }}
       run: |
+        VERSION=$(tr -d '[:space:]' < .github/claude-plus/VERSION)
+        ls -la dist
         cat > notes.md <<NOTES
         Zed ${VERSION%%-plus*} with Claude Code Plus additions, built from \`${GITHUB_SHA::7}\`.
 
@@ -113,8 +124,13 @@ jobs:
         - Shows plan usage limits (session and weekly) in the context usage tooltip, with claude-agent-acp-plus 0.94.0-plus.10 or later.
         - \`/clear\`, \`/reset\` and \`/new\` open a new thread for the same agent when it advertises \`newThreadCommands\` (claude-agent-acp-plus 0.94.0-plus.8+).
         NOTES
-        gh release create "v${VERSION}" dist/* \
+        if ! output=$(gh release create "v${VERSION}" dist/* \
           --repo "$GITHUB_REPOSITORY" \
           --target "$GITHUB_SHA" \
           --title "Zed Claude Code Plus ${VERSION}" \
-          --notes-file notes.md
+          --notes-file notes.md 2>&1); then
+          echo "$output"
+          echo "::error title=gh release create failed::${output//$'\n'/%0A}"
+          exit 1
+        fi
+        echo "$output"
