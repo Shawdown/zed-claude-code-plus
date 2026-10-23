@@ -5331,6 +5331,26 @@ impl ThreadView {
         let usage = thread.token_usage()?;
         let plan_usage = thread.plan_usage().cloned();
         let show_split = self.supports_split_token_display(cx);
+        let weekly_utilization = plan_usage.as_ref().and_then(|plan_usage| {
+            let limit = plan_usage
+                .limits
+                .iter()
+                .find(|limit| limit.label == "Weekly · all models")
+                .or_else(|| {
+                    plan_usage
+                        .limits
+                        .iter()
+                        .find(|limit| limit.label.starts_with("Weekly"))
+                })?;
+            if limit
+                .resets_at
+                .is_some_and(|resets_at| resets_at <= chrono::Utc::now())
+            {
+                Some(0.0)
+            } else {
+                Some(limit.utilization.clamp(0.0, 100.0))
+            }
+        });
 
         let cost_label = thread.cost().map(|cost| {
             let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
@@ -5506,8 +5526,19 @@ impl ThreadView {
                     .id("circular_progress_tokens")
                     .mt_px()
                     .mr_1()
-                    .child(
-                        CircularProgress::new(
+                    .child(match weekly_utilization {
+                        Some(utilization) => {
+                            CircularProgress::new(utilization, 100.0, ring_size, cx)
+                                .stroke_width(stroke_width)
+                                .progress_color(if utilization >= 90.0 {
+                                    cx.theme().status().error
+                                } else if utilization >= 75.0 {
+                                    cx.theme().status().warning
+                                } else {
+                                    cx.theme().colors().text_muted
+                                })
+                        }
+                        None => CircularProgress::new(
                             usage.used_tokens as f32,
                             usage.max_tokens as f32,
                             ring_size,
@@ -5515,7 +5546,7 @@ impl ThreadView {
                         )
                         .stroke_width(stroke_width)
                         .progress_color(progress_color(progress_ratio)),
-                    )
+                    })
                     .hoverable_tooltip(build_tooltip)
                     .into_any_element(),
             )
