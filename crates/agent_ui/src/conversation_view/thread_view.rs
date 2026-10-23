@@ -6382,7 +6382,11 @@ struct TokenUsageTooltip {
 }
 
 fn plan_usage_reset_label(resets_at: chrono::DateTime<chrono::Utc>) -> String {
-    let total_minutes = (resets_at - chrono::Utc::now()).num_minutes().max(1);
+    let remaining = resets_at - chrono::Utc::now();
+    if remaining <= chrono::TimeDelta::zero() {
+        return "Reset".to_string();
+    }
+    let total_minutes = remaining.num_minutes().max(1);
     let days = total_minutes / (24 * 60);
     let hours = total_minutes % (24 * 60) / 60;
     let minutes = total_minutes % 60;
@@ -6505,9 +6509,17 @@ impl Render for TokenUsageTooltip {
                             )
                             .children(plan_usage.limits.into_iter().enumerate().map(
                                 |(index, limit)| {
-                                    let fill_color = if limit.utilization >= 90.0 {
+                                    let utilization = if limit
+                                        .resets_at
+                                        .is_some_and(|resets_at| resets_at <= chrono::Utc::now())
+                                    {
+                                        0.0
+                                    } else {
+                                        limit.utilization
+                                    };
+                                    let fill_color = if utilization >= 90.0 {
                                         cx.theme().status().error
-                                    } else if limit.utilization >= 75.0 {
+                                    } else if utilization >= 75.0 {
                                         cx.theme().status().warning
                                     } else {
                                         cx.theme().status().info
@@ -6538,13 +6550,13 @@ impl Render for TokenUsageTooltip {
                                                 )
                                                 .child(Label::new(format!(
                                                     "{}%",
-                                                    limit.utilization.round() as u32
+                                                    utilization.round() as u32
                                                 ))),
                                         )
                                         .child(
                                             ProgressBar::new(
                                                 ("plan-usage-limit", index),
-                                                limit.utilization,
+                                                utilization,
                                                 100.0,
                                                 cx,
                                             )
