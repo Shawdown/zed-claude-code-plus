@@ -2027,6 +2027,14 @@ impl AgentConnection for AcpConnection {
             .iter()
             .find(|method| method.method_id() == method_id)?;
 
+        if matches!(
+            method,
+            acp_v2::AuthMethod::Terminal(_) | acp_v2::AuthMethod::Agent(_)
+        ) && let Some(task) = meta_terminal_auth_task(&self.id, method_id, method)
+        {
+            return Some(Task::ready(Ok(task)));
+        }
+
         match method {
             acp_v2::AuthMethod::Terminal(terminal) => {
                 let agent_id = self.id.clone();
@@ -2054,8 +2062,6 @@ impl AgentConnection for AcpConnection {
                     Ok(terminal_auth_task(&command, &agent_id, &terminal))
                 }))
             }
-            acp_v2::AuthMethod::Agent(_) => meta_terminal_auth_task(&self.id, method_id, method)
-                .map(|task| Task::ready(Ok(task))),
             _ => None,
         }
     }
@@ -6038,15 +6044,7 @@ mod tests {
                 .env(std::collections::HashMap::from_iter([
                     ("SHARED".into(), "override".into()),
                     ("EMPTY".into(), "".into()),
-                ]))
-                .meta(acp::Meta::from_iter([(
-                    "terminal-auth".to_string(),
-                    serde_json::json!({
-                        "label": "Legacy login",
-                        "command": "legacy-agent",
-                        "args": ["legacy-auth"],
-                    }),
-                )])),
+                ])),
         )])
         .expect("terminal authentication should adapt");
         let Some(acp_v2::AuthMethod::Terminal(terminal)) = methods.first_mut() else {
@@ -6089,6 +6087,30 @@ mod tests {
         cx.update(|cx| harness.connection.authenticate(method_id.clone(), cx))
             .await
             .expect_err("terminal auth must not use the agent-managed login RPC");
+
+        let Some(acp_v2::AuthMethod::Terminal(terminal)) = Rc::get_mut(&mut harness.connection)
+            .expect("test harness should have the only connection handle")
+            .auth_methods
+            .first_mut()
+        else {
+            panic!("expected a shared terminal authentication method");
+        };
+        terminal.meta = Some(acp_v2::Meta::from_iter([(
+            "terminal-auth".to_string(),
+            serde_json::json!({
+                "label": "Direct login",
+                "command": "/usr/bin/node",
+                "args": ["/agent/index.js", "--cli"],
+            }),
+        )]));
+        let terminal_task = cx
+            .update(|cx| harness.connection.terminal_auth_task(&method_id, cx))
+            .expect("terminal auth with a direct command should be routed")
+            .await
+            .expect("a direct command should not need the external agent command");
+        assert_eq!(terminal_task.command.as_deref(), Some("/usr/bin/node"));
+        assert_eq!(terminal_task.args, vec!["/agent/index.js", "--cli"]);
+        assert_eq!(terminal_task.label, "Direct login");
 
         let unknown = serde_json::json!({
             "type": "_future_login",

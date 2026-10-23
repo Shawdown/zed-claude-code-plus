@@ -74,7 +74,8 @@ use util::{
     time::duration_alt_display,
 };
 use workspace::{
-    CollaboratorId, MultiWorkspace, NewTerminal, PathList, Workspace, path_link::sanitize_path_text,
+    CollaboratorId, MultiWorkspace, NewTerminal, PathList, Toast, Workspace,
+    notifications::NotificationId, path_link::sanitize_path_text,
 };
 use zed_actions::agent::{Chat, ToggleModelSelector};
 
@@ -2308,11 +2309,7 @@ impl ConversationView {
                                 pending_auth_method.take();
                                 cx.emit(StateChange);
                             }
-                            if let Some(active) = this.root_thread_view() {
-                                active.update(cx, |active, cx| {
-                                    active.handle_thread_error(err, cx);
-                                })
-                            }
+                            this.show_auth_error(err, cx);
                         } else {
                             this.reset(window, cx);
                         }
@@ -2358,9 +2355,7 @@ impl ConversationView {
                             pending_auth_method.take();
                             cx.emit(StateChange);
                         }
-                        if let Some(active) = this.root_thread_view() {
-                            active.update(cx, |active, cx| active.handle_thread_error(err, cx));
-                        }
+                        this.show_auth_error(err, cx);
                     } else {
                         this.reset(window, cx);
                     }
@@ -2427,6 +2422,23 @@ impl ConversationView {
             })
         })
         .detach();
+    }
+
+    fn show_auth_error(&mut self, err: anyhow::Error, cx: &mut Context<Self>) {
+        if let Some(active) = self.root_thread_view() {
+            active.update(cx, |active, cx| active.handle_thread_error(err, cx));
+        } else if let Some(workspace) = self.workspace.upgrade() {
+            struct AgentAuthError;
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<AgentAuthError>(),
+                        format!("Authentication failed: {err:#}"),
+                    ),
+                    cx,
+                );
+            });
+        }
     }
 
     fn spawn_external_agent_login(
