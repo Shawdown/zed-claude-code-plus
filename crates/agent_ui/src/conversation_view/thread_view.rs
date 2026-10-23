@@ -45,8 +45,8 @@ use notifications::status_toast::StatusToast;
 use project::ResolvedPath;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
-    SplitButtonStyle, Tab, ToggleState,
+    ButtonLike, CalloutBorderPosition, Checkbox, ProgressBar, SpinnerLabel, SpinnerVariant,
+    SplitButton, SplitButtonStyle, Tab, ToggleState,
 };
 use url::Url;
 use util::markdown::source_position_from_fragment;
@@ -5329,6 +5329,7 @@ impl ThreadView {
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
         let usage = thread.token_usage()?;
+        let plan_usage = thread.plan_usage().cloned();
         let show_split = self.supports_split_token_display(cx);
 
         let cost_label = thread.cost().map(|cost| {
@@ -5415,6 +5416,7 @@ impl ThreadView {
                 let project_entry_ids = project_entry_ids.clone();
                 let workspace = workspace.clone();
                 let cost_label = cost_label.clone();
+                let plan_usage = plan_usage.clone();
                 cx.new(move |_cx| TokenUsageTooltip {
                     percentage,
                     used,
@@ -5425,6 +5427,7 @@ impl ThreadView {
                     output_max: output_max_label,
                     show_split,
                     cost_label,
+                    plan_usage,
                     separator_color: tooltip_separator_color,
                     global_agents_md_loaded,
                     project_rules_count,
@@ -6370,11 +6373,43 @@ struct TokenUsageTooltip {
     output_max: String,
     show_split: bool,
     cost_label: Option<String>,
+    plan_usage: Option<acp_thread::PlanUsage>,
     separator_color: Color,
     global_agents_md_loaded: bool,
     project_rules_count: usize,
     project_entry_ids: Vec<ProjectEntryId>,
     workspace: WeakEntity<Workspace>,
+}
+
+fn plan_usage_reset_label(resets_at: chrono::DateTime<chrono::Utc>) -> String {
+    let total_minutes = (resets_at - chrono::Utc::now()).num_minutes().max(1);
+    let days = total_minutes / (24 * 60);
+    let hours = total_minutes % (24 * 60) / 60;
+    let minutes = total_minutes % 60;
+    if days > 0 {
+        format!(
+            "Resets in {} {} {} hr",
+            days,
+            pluralize("day", days as usize),
+            hours
+        )
+    } else if hours > 0 {
+        format!("Resets in {} hr {} min", hours, minutes)
+    } else {
+        format!("Resets in {} min", minutes)
+    }
+}
+
+fn plan_usage_header(subscription_type: Option<&str>) -> String {
+    let mut characters = subscription_type.unwrap_or_default().chars();
+    match characters.next() {
+        Some(first) => format!(
+            "Plan usage limits \u{b7} {}{}",
+            first.to_uppercase(),
+            characters.as_str()
+        ),
+        None => "Plan usage limits".to_string(),
+    }
 }
 
 impl Render for TokenUsageTooltip {
@@ -6389,6 +6424,7 @@ impl Render for TokenUsageTooltip {
         let output_max = self.output_max.clone();
         let show_split = self.show_split;
         let cost_label = self.cost_label.clone();
+        let plan_usage = self.plan_usage.clone();
         let global_agents_md_loaded = self.global_agents_md_loaded;
         let project_rules_count = self.project_rules_count;
         let project_entry_ids = self.project_entry_ids.clone();
@@ -6397,6 +6433,7 @@ impl Render for TokenUsageTooltip {
         ui::tooltip_container(cx, move |container, cx| {
             container
                 .min_w_40()
+                .when(plan_usage.is_some(), |this| this.min_w_64())
                 .child(
                     Label::new("Context")
                         .color(Color::Muted)
@@ -6449,6 +6486,73 @@ impl Render for TokenUsageTooltip {
                                     .size(LabelSize::Small),
                             )
                             .child(Label::new(cost_label)),
+                    )
+                })
+                .when_some(plan_usage, |this, plan_usage| {
+                    this.child(
+                        v_flex()
+                            .mt_1p5()
+                            .pt_1p5()
+                            .gap_1p5()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new(plan_usage_header(
+                                    plan_usage.subscription_type.as_deref(),
+                                ))
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                            )
+                            .children(plan_usage.limits.into_iter().enumerate().map(
+                                |(index, limit)| {
+                                    let fill_color = if limit.utilization >= 90.0 {
+                                        cx.theme().status().error
+                                    } else if limit.utilization >= 75.0 {
+                                        cx.theme().status().warning
+                                    } else {
+                                        cx.theme().status().info
+                                    };
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            h_flex()
+                                                .justify_between()
+                                                .gap_2()
+                                                .child(
+                                                    v_flex()
+                                                        .child(Label::new(limit.label))
+                                                        .when_some(
+                                                            limit.resets_at,
+                                                            |this, resets_at| {
+                                                                this.child(
+                                                                    Label::new(
+                                                                        plan_usage_reset_label(
+                                                                            resets_at,
+                                                                        ),
+                                                                    )
+                                                                    .color(Color::Muted)
+                                                                    .size(LabelSize::Small),
+                                                                )
+                                                            },
+                                                        ),
+                                                )
+                                                .child(Label::new(format!(
+                                                    "{}%",
+                                                    limit.utilization.round() as u32
+                                                ))),
+                                        )
+                                        .child(
+                                            ProgressBar::new(
+                                                ("plan-usage-limit", index),
+                                                limit.utilization,
+                                                100.0,
+                                                cx,
+                                            )
+                                            .fg_color(fill_color)
+                                            .over_color(fill_color),
+                                        )
+                                },
+                            )),
                     )
                 })
                 .when(

@@ -3337,6 +3337,23 @@ pub struct SessionCost {
     pub meta: Option<acp_v2::Meta>,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanUsage {
+    pub subscription_type: Option<String>,
+    pub limits: Vec<PlanUsageLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanUsageLimit {
+    pub label: String,
+    pub utilization: f32,
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub const PLAN_USAGE_META_KEY: &str = "claudeCodePlus/planUsage";
+
 pub const TOKEN_USAGE_WARNING_THRESHOLD: f32 = 0.8;
 
 impl TokenUsage {
@@ -3434,6 +3451,7 @@ pub struct AcpThread {
     activity: SessionActivity,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
+    plan_usage: Option<PlanUsage>,
     prompt_capabilities: acp_v2::PromptCapabilities,
     available_commands: Vec<acp_v2::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
@@ -3772,6 +3790,7 @@ impl AcpThread {
             connection,
             token_usage: None,
             cost: None,
+            plan_usage: None,
             prompt_capabilities,
             available_commands: Vec::new(),
             _observe_prompt_capabilities: task,
@@ -4282,6 +4301,10 @@ impl AcpThread {
 
     pub fn cost(&self) -> Option<&SessionCost> {
         self.cost.as_ref()
+    }
+
+    pub fn plan_usage(&self) -> Option<&PlanUsage> {
+        self.plan_usage.as_ref()
     }
 
     pub fn has_pending_edit_tool_calls(&self) -> bool {
@@ -5319,6 +5342,16 @@ impl AcpThread {
                 currency: cost.currency.into(),
                 meta: cost.meta,
             });
+        }
+        if let Some(plan_usage) = update
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(PLAN_USAGE_META_KEY))
+        {
+            match serde_json::from_value::<PlanUsage>(plan_usage.clone()) {
+                Ok(plan_usage) => self.plan_usage = Some(plan_usage),
+                Err(error) => log::warn!("Ignoring malformed plan usage: {error}"),
+            }
         }
         cx.emit(AcpThreadEvent::TokenUsageUpdated);
     }
@@ -20920,6 +20953,93 @@ mod tests {
 
             let cost = thread.cost().expect("cost should be preserved");
             assert!((cost.amount - 0.10).abs() < f64::EPSILON);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_usage_update_reads_plan_usage_from_meta(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let plan_usage_meta = |plan_usage: serde_json::Value| {
+            let mut meta = acp_v1::Meta::new();
+            meta.insert(PLAN_USAGE_META_KEY.to_string(), plan_usage);
+            meta
+        };
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(acp_v1::UsageUpdate::new(1000, 10000).meta(
+                        plan_usage_meta(serde_json::json!({
+                            "subscriptionType": "max",
+                            "limits": [
+                                {
+                                    "label": "Session limit",
+                                    "utilization": 35,
+                                    "resetsAt": "2026-10-23T15:00:00.000Z"
+                                },
+                                {
+                                    "label": "Weekly · all models",
+                                    "utilization": 96.5,
+                                    "resetsAt": null
+                                }
+                            ]
+                        })),
+                    )),
+                    cx,
+                )
+                .unwrap();
+
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(
+                        acp_v1::UsageUpdate::new(2000, 10000)
+                            .meta(plan_usage_meta(serde_json::json!({ "limits": "invalid" }))),
+                    ),
+                    cx,
+                )
+                .unwrap();
+
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(acp_v1::UsageUpdate::new(3000, 10000)),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let plan_usage = thread.plan_usage().expect("plan usage should be set");
+            assert_eq!(plan_usage.subscription_type.as_deref(), Some("max"));
+            assert_eq!(
+                plan_usage.limits,
+                vec![
+                    PlanUsageLimit {
+                        label: "Session limit".to_string(),
+                        utilization: 35.0,
+                        resets_at: Some(
+                            chrono::DateTime::parse_from_rfc3339("2026-10-23T15:00:00Z")
+                                .unwrap()
+                                .to_utc()
+                        ),
+                    },
+                    PlanUsageLimit {
+                        label: "Weekly · all models".to_string(),
+                        utilization: 96.5,
+                        resets_at: None,
+                    },
+                ]
+            );
         });
     }
 
