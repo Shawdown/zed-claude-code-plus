@@ -45,8 +45,8 @@ use notifications::status_toast::StatusToast;
 use project::ResolvedPath;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, ProgressBar, SpinnerLabel, SpinnerVariant,
-    SplitButton, SplitButtonStyle, Tab, ToggleState,
+    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
+    SplitButtonStyle, Tab, ToggleState,
 };
 use url::Url;
 use util::markdown::source_position_from_fragment;
@@ -6422,16 +6422,22 @@ fn plan_usage_reset_label(resets_at: chrono::DateTime<chrono::Utc>) -> String {
     let hours = total_minutes % (24 * 60) / 60;
     let minutes = total_minutes % 60;
     if days > 0 {
-        format!(
-            "Resets in {} {} {} hr",
-            days,
-            pluralize("day", days as usize),
-            hours
-        )
+        format!("{days}d {hours}h")
     } else if hours > 0 {
-        format!("Resets in {} hr {} min", hours, minutes)
+        format!("{hours}h {minutes}m")
     } else {
-        format!("Resets in {} min", minutes)
+        format!("{minutes}m")
+    }
+}
+
+fn plan_usage_row_name(label: &str) -> (String, bool) {
+    match label {
+        "Session limit" => ("Session".to_string(), false),
+        "Weekly \u{b7} all models" => ("Weekly".to_string(), false),
+        _ => match label.strip_prefix("Weekly \u{b7} ") {
+            Some(model) => (model.to_string(), true),
+            None => (label.to_string(), false),
+        },
     }
 }
 
@@ -6439,11 +6445,11 @@ fn plan_usage_header(subscription_type: Option<&str>) -> String {
     let mut characters = subscription_type.unwrap_or_default().chars();
     match characters.next() {
         Some(first) => format!(
-            "Plan usage limits \u{b7} {}{}",
+            "Plan usage \u{b7} {}{}",
             first.to_uppercase(),
             characters.as_str()
         ),
-        None => "Plan usage limits".to_string(),
+        None => "Plan usage".to_string(),
     }
 }
 
@@ -6468,7 +6474,7 @@ impl Render for TokenUsageTooltip {
         ui::tooltip_container(cx, move |container, cx| {
             container
                 .min_w_40()
-                .when(plan_usage.is_some(), |this| this.min_w_64())
+                .when(plan_usage.is_some(), |this| this.min_w_72())
                 .child(
                     Label::new("Context")
                         .color(Color::Muted)
@@ -6538,64 +6544,101 @@ impl Render for TokenUsageTooltip {
                                 .color(Color::Muted)
                                 .size(LabelSize::Small),
                             )
-                            .children(plan_usage.limits.into_iter().enumerate().map(
-                                |(index, limit)| {
+                            .children({
+                                let now = chrono::Utc::now();
+                                let weekly_resets_at = plan_usage
+                                    .limits
+                                    .iter()
+                                    .find(|limit| limit.label == "Weekly \u{b7} all models")
+                                    .and_then(|limit| limit.resets_at);
+                                let track_color = cx.theme().colors().text_muted.opacity(0.2);
+                                let normal_color = cx.theme().colors().text_muted;
+                                let warning_color = cx.theme().status().warning;
+                                let error_color = cx.theme().status().error;
+                                plan_usage.limits.into_iter().map(move |limit| {
+                                    let (name, is_model) = plan_usage_row_name(&limit.label);
                                     let utilization = if limit
                                         .resets_at
-                                        .is_some_and(|resets_at| resets_at <= chrono::Utc::now())
+                                        .is_some_and(|resets_at| resets_at <= now)
                                     {
                                         0.0
                                     } else {
-                                        limit.utilization
+                                        limit.utilization.clamp(0.0, 100.0)
                                     };
-                                    let fill_color = if utilization >= 90.0 {
-                                        cx.theme().status().error
+                                    let (fill_color, percentage_color) = if utilization >= 90.0 {
+                                        (error_color, Some(Color::Error))
                                     } else if utilization >= 75.0 {
-                                        cx.theme().status().warning
+                                        (warning_color, Some(Color::Warning))
                                     } else {
-                                        cx.theme().status().info
+                                        (normal_color, None)
                                     };
-                                    v_flex()
-                                        .gap_0p5()
+                                    let reset_label = limit
+                                        .resets_at
+                                        .filter(|resets_at| {
+                                            !(is_model && Some(*resets_at) == weekly_resets_at)
+                                        })
+                                        .map(plan_usage_reset_label);
+                                    h_flex()
+                                        .gap_2p5()
                                         .child(
-                                            h_flex()
-                                                .justify_between()
-                                                .gap_2()
+                                            div()
+                                                .w(px(64.))
+                                                .flex_shrink_0()
+                                                .when(is_model, |this| this.pl_3())
                                                 .child(
-                                                    v_flex()
-                                                        .child(Label::new(limit.label))
-                                                        .when_some(
-                                                            limit.resets_at,
-                                                            |this, resets_at| {
-                                                                this.child(
-                                                                    Label::new(
-                                                                        plan_usage_reset_label(
-                                                                            resets_at,
-                                                                        ),
-                                                                    )
-                                                                    .color(Color::Muted)
-                                                                    .size(LabelSize::Small),
-                                                                )
-                                                            },
-                                                        ),
-                                                )
-                                                .child(Label::new(format!(
-                                                    "{}%",
-                                                    utilization.round() as u32
-                                                ))),
+                                                    Label::new(name)
+                                                        .truncate()
+                                                        .when(is_model, |this| {
+                                                            this.color(Color::Muted)
+                                                        }),
+                                                ),
                                         )
                                         .child(
-                                            ProgressBar::new(
-                                                ("plan-usage-limit", index),
-                                                utilization,
-                                                100.0,
-                                                cx,
-                                            )
-                                            .fg_color(fill_color)
-                                            .over_color(fill_color),
+                                            div()
+                                                .flex_1()
+                                                .h(px(4.))
+                                                .rounded_full()
+                                                .bg(track_color)
+                                                .child(
+                                                    div()
+                                                        .h_full()
+                                                        .rounded_full()
+                                                        .bg(fill_color)
+                                                        .w(relative(utilization / 100.0)),
+                                                ),
                                         )
-                                },
-                            )),
+                                        .child(
+                                            div()
+                                                .w(px(34.))
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .justify_end()
+                                                .child(
+                                                    Label::new(format!(
+                                                        "{}%",
+                                                        utilization.round() as u32
+                                                    ))
+                                                    .when_some(percentage_color, |this, color| {
+                                                        this.color(color)
+                                                    }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(44.))
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .justify_end()
+                                                .when_some(reset_label, |this, reset_label| {
+                                                    this.child(
+                                                        Label::new(reset_label)
+                                                            .color(Color::Disabled)
+                                                            .size(LabelSize::Small),
+                                                    )
+                                                }),
+                                        )
+                                })
+                            }),
                     )
                 })
                 .when(
