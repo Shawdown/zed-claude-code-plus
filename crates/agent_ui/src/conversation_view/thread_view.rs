@@ -621,6 +621,7 @@ pub struct ThreadView {
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
     _sandbox_status_refresh_task: Option<Task<()>>,
+    _prompt_cache_refresh_task: Option<Task<()>>,
     pub hovered_edited_file_buttons: Option<usize>,
     pub current_submission: Option<SubmissionId>,
     pub _subscriptions: Vec<Subscription>,
@@ -1060,6 +1061,7 @@ impl ThreadView {
             _save_task: None,
             _draft_resolve_task: None,
             _sandbox_status_refresh_task: None,
+            _prompt_cache_refresh_task: None,
             hovered_edited_file_buttons: None,
             current_submission,
             message_editor,
@@ -5080,7 +5082,8 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx)),
+                                    .children(self.render_thinking_control(cx))
+                                    .children(self.render_prompt_cache_indicator(cx)),
                             )
                             .child(
                                 h_flex()
@@ -5331,8 +5334,18 @@ impl ThreadView {
         let usage = thread.token_usage()?;
         let plan_usage = thread.plan_usage().cloned();
         let show_split = self.supports_split_token_display(cx);
+        let current_utilization = |limit: &acp_thread::PlanUsageLimit| {
+            if limit
+                .resets_at
+                .is_some_and(|resets_at| resets_at <= chrono::Utc::now())
+            {
+                0.0
+            } else {
+                limit.utilization.clamp(0.0, 100.0)
+            }
+        };
         let weekly_utilization = plan_usage.as_ref().and_then(|plan_usage| {
-            let limit = plan_usage
+            plan_usage
                 .limits
                 .iter()
                 .find(|limit| limit.label == "Weekly · all models")
@@ -5341,15 +5354,15 @@ impl ThreadView {
                         .limits
                         .iter()
                         .find(|limit| limit.label.starts_with("Weekly"))
-                })?;
-            if limit
-                .resets_at
-                .is_some_and(|resets_at| resets_at <= chrono::Utc::now())
-            {
-                Some(0.0)
-            } else {
-                Some(limit.utilization.clamp(0.0, 100.0))
-            }
+                })
+                .map(current_utilization)
+        });
+        let session_utilization = plan_usage.as_ref().and_then(|plan_usage| {
+            plan_usage
+                .limits
+                .iter()
+                .find(|limit| limit.label == "Session limit")
+                .map(current_utilization)
         });
 
         let cost_label = thread.cost().map(|cost| {
@@ -5363,6 +5376,16 @@ impl ThreadView {
 
         let progress_color = |ratio: f32| -> Hsla {
             if ratio >= 0.85 {
+                cx.theme().status().warning
+            } else {
+                cx.theme().colors().text_muted
+            }
+        };
+
+        let limit_color = |utilization: f32| -> Hsla {
+            if utilization >= 90.0 {
+                cx.theme().status().error
+            } else if utilization >= 75.0 {
                 cx.theme().status().warning
             } else {
                 cx.theme().colors().text_muted
@@ -5526,17 +5549,22 @@ impl ThreadView {
                     .id("circular_progress_tokens")
                     .mt_px()
                     .mr_1()
+                    .gap_1()
+                    .when_some(
+                        session_utilization.filter(|_| weekly_utilization.is_some()),
+                        |this, utilization| {
+                            this.child(
+                                CircularProgress::new(utilization, 100.0, ring_size, cx)
+                                    .stroke_width(stroke_width)
+                                    .progress_color(limit_color(utilization)),
+                            )
+                        },
+                    )
                     .child(match weekly_utilization {
                         Some(utilization) => {
                             CircularProgress::new(utilization, 100.0, ring_size, cx)
                                 .stroke_width(stroke_width)
-                                .progress_color(if utilization >= 90.0 {
-                                    cx.theme().status().error
-                                } else if utilization >= 75.0 {
-                                    cx.theme().status().warning
-                                } else {
-                                    cx.theme().colors().text_muted
-                                })
+                                .progress_color(limit_color(utilization))
                         }
                         None => CircularProgress::new(
                             usage.used_tokens as f32,
@@ -6354,6 +6382,62 @@ impl ThreadView {
             })
     }
 
+    fn render_prompt_cache_indicator(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let prompt_cache = self.thread.read(cx).prompt_cache()?.clone();
+        if self._prompt_cache_refresh_task.is_none() {
+            self._prompt_cache_refresh_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(15))
+                        .await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        let now = chrono::Utc::now();
+        let remaining = prompt_cache.expires_at() - now;
+        let indicator = h_flex()
+            .id("prompt-cache-indicator")
+            .h_6()
+            .px_1()
+            .gap_1()
+            .flex_none()
+            .rounded_sm();
+
+        let element = if remaining > chrono::TimeDelta::zero() {
+            let minutes_left = (remaining.num_seconds() + 59) / 60;
+            let tooltip = format!("Prompt cache warm, about {minutes_left} min left.");
+            indicator
+                .child(
+                    Icon::new(IconName::Clock)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!("{minutes_left}m"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text(tooltip))
+                .into_any_element()
+        } else {
+            let idle = compact_duration(now - prompt_cache.last_request_at);
+            let tooltip = format!("Prompt cache likely expired (idle {idle}).");
+            indicator
+                .child(
+                    Icon::new(IconName::Clock)
+                        .size(IconSize::Small)
+                        .color(Color::Error),
+                )
+                .tooltip(Tooltip::text(tooltip))
+                .into_any_element()
+        };
+        Some(element)
+    }
+
     fn render_follow_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let following = self.is_following(cx);
 
@@ -6417,7 +6501,11 @@ fn plan_usage_reset_label(resets_at: chrono::DateTime<chrono::Utc>) -> String {
     if remaining <= chrono::TimeDelta::zero() {
         return "Reset".to_string();
     }
-    let total_minutes = remaining.num_minutes().max(1);
+    compact_duration(remaining)
+}
+
+fn compact_duration(duration: chrono::TimeDelta) -> String {
+    let total_minutes = duration.num_minutes().max(1);
     let days = total_minutes / (24 * 60);
     let hours = total_minutes % (24 * 60) / 60;
     let minutes = total_minutes % 60;

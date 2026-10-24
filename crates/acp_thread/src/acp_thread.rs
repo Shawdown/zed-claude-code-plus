@@ -3354,6 +3354,21 @@ pub struct PlanUsageLimit {
 
 pub const PLAN_USAGE_META_KEY: &str = "claudeCodePlus/planUsage";
 
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptCache {
+    pub last_request_at: chrono::DateTime<chrono::Utc>,
+    pub ttl_seconds: u32,
+}
+
+impl PromptCache {
+    pub fn expires_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.last_request_at + chrono::TimeDelta::seconds(i64::from(self.ttl_seconds))
+    }
+}
+
+pub const PROMPT_CACHE_META_KEY: &str = "claudeCodePlus/promptCache";
+
 pub const TOKEN_USAGE_WARNING_THRESHOLD: f32 = 0.8;
 
 impl TokenUsage {
@@ -3452,6 +3467,7 @@ pub struct AcpThread {
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
     plan_usage: Option<PlanUsage>,
+    prompt_cache: Option<PromptCache>,
     prompt_capabilities: acp_v2::PromptCapabilities,
     available_commands: Vec<acp_v2::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
@@ -3791,6 +3807,7 @@ impl AcpThread {
             token_usage: None,
             cost: None,
             plan_usage: None,
+            prompt_cache: None,
             prompt_capabilities,
             available_commands: Vec::new(),
             _observe_prompt_capabilities: task,
@@ -4305,6 +4322,10 @@ impl AcpThread {
 
     pub fn plan_usage(&self) -> Option<&PlanUsage> {
         self.plan_usage.as_ref()
+    }
+
+    pub fn prompt_cache(&self) -> Option<&PromptCache> {
+        self.prompt_cache.as_ref()
     }
 
     pub fn has_pending_edit_tool_calls(&self) -> bool {
@@ -5351,6 +5372,16 @@ impl AcpThread {
             match serde_json::from_value::<PlanUsage>(plan_usage.clone()) {
                 Ok(plan_usage) => self.plan_usage = Some(plan_usage),
                 Err(error) => log::warn!("Ignoring malformed plan usage: {error}"),
+            }
+        }
+        if let Some(prompt_cache) = update
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(PROMPT_CACHE_META_KEY))
+        {
+            match serde_json::from_value::<PromptCache>(prompt_cache.clone()) {
+                Ok(prompt_cache) => self.prompt_cache = Some(prompt_cache),
+                Err(error) => log::warn!("Ignoring malformed prompt cache state: {error}"),
             }
         }
         cx.emit(AcpThreadEvent::TokenUsageUpdated);
@@ -16321,6 +16352,7 @@ mod tests {
             assert_eq!(tool_call_location.path, skill_path);
 
             let buffer = agent_location
+                .expect("text location should resolve to an agent location")
                 .buffer
                 .upgrade()
                 .expect("resolved location should keep an open buffer");
@@ -21039,6 +21071,69 @@ mod tests {
                         resets_at: None,
                     },
                 ]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_usage_update_reads_prompt_cache_from_meta(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let prompt_cache_meta = |prompt_cache: serde_json::Value| {
+            let mut meta = acp_v1::Meta::new();
+            meta.insert(PROMPT_CACHE_META_KEY.to_string(), prompt_cache);
+            meta
+        };
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(acp_v1::UsageUpdate::new(1000, 10000).meta(
+                        prompt_cache_meta(serde_json::json!({
+                            "lastRequestAt": "2026-10-23T15:00:00.000Z",
+                            "ttlSeconds": 3600
+                        })),
+                    )),
+                    cx,
+                )
+                .unwrap();
+
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(
+                        acp_v1::UsageUpdate::new(2000, 10000)
+                            .meta(prompt_cache_meta(serde_json::json!({ "ttlSeconds": "x" }))),
+                    ),
+                    cx,
+                )
+                .unwrap();
+
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(acp_v1::UsageUpdate::new(3000, 10000)),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let prompt_cache = thread.prompt_cache().expect("prompt cache should be set");
+            assert_eq!(prompt_cache.ttl_seconds, 3600);
+            assert_eq!(
+                prompt_cache.expires_at(),
+                chrono::DateTime::parse_from_rfc3339("2026-10-23T16:00:00Z")
+                    .unwrap()
+                    .to_utc()
             );
         });
     }
