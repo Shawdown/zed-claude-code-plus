@@ -995,7 +995,7 @@ impl AgentThreadEntry {
         }
     }
 
-    pub fn location(&self, ix: usize) -> Option<(ToolCallLocation, AgentLocation)> {
+    pub fn location(&self, ix: usize) -> Option<(ToolCallLocation, Option<AgentLocation>)> {
         if let AgentThreadEntry::ToolCall(ToolCall {
             locations,
             resolved_locations,
@@ -1004,7 +1004,7 @@ impl AgentThreadEntry {
         {
             Some((
                 locations.get(ix)?.clone(),
-                resolved_locations.get(ix)?.clone()?,
+                resolved_locations.get(ix).cloned().flatten(),
             ))
         } else {
             None
