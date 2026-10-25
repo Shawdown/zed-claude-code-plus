@@ -3355,15 +3355,47 @@ pub struct PlanUsageLimit {
 pub const PLAN_USAGE_META_KEY: &str = "claudeCodePlus/planUsage";
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PromptCache {
-    pub last_request_at: chrono::DateTime<chrono::Utc>,
-    pub ttl_seconds: u32,
+#[serde(untagged)]
+pub enum PromptCache {
+    #[serde(rename_all = "camelCase")]
+    Window {
+        last_request_at: chrono::DateTime<chrono::Utc>,
+        ttl_seconds: u32,
+    },
+    #[serde(rename_all = "camelCase")]
+    Compacted {
+        compacted_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PromptCacheState {
+    Warm { time_left: chrono::TimeDelta },
+    Expired { idle: chrono::TimeDelta },
+    Compacted { idle: chrono::TimeDelta },
 }
 
 impl PromptCache {
-    pub fn expires_at(&self) -> chrono::DateTime<chrono::Utc> {
-        self.last_request_at + chrono::TimeDelta::seconds(i64::from(self.ttl_seconds))
+    pub fn state(&self, now: chrono::DateTime<chrono::Utc>) -> PromptCacheState {
+        match self {
+            PromptCache::Compacted { compacted_at } => PromptCacheState::Compacted {
+                idle: (now - *compacted_at).max(chrono::TimeDelta::zero()),
+            },
+            PromptCache::Window {
+                last_request_at,
+                ttl_seconds,
+            } => {
+                let ttl = chrono::TimeDelta::seconds(i64::from(*ttl_seconds));
+                let time_left = ttl.min(*last_request_at + ttl - now);
+                if time_left > chrono::TimeDelta::zero() {
+                    PromptCacheState::Warm { time_left }
+                } else {
+                    PromptCacheState::Expired {
+                        idle: now - *last_request_at,
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -5379,8 +5411,8 @@ impl AcpThread {
             .as_ref()
             .and_then(|meta| meta.get(PROMPT_CACHE_META_KEY))
         {
-            match serde_json::from_value::<PromptCache>(prompt_cache.clone()) {
-                Ok(prompt_cache) => self.prompt_cache = Some(prompt_cache),
+            match serde_json::from_value::<Option<PromptCache>>(prompt_cache.clone()) {
+                Ok(prompt_cache) => self.prompt_cache = prompt_cache,
                 Err(error) => log::warn!("Ignoring malformed prompt cache state: {error}"),
             }
         }
@@ -21126,15 +21158,75 @@ mod tests {
                 .unwrap();
         });
 
+        let request_at = chrono::DateTime::parse_from_rfc3339("2026-10-23T15:00:00Z")
+            .unwrap()
+            .to_utc();
         thread.read_with(cx, |thread, _| {
             let prompt_cache = thread.prompt_cache().expect("prompt cache should be set");
-            assert_eq!(prompt_cache.ttl_seconds, 3600);
             assert_eq!(
-                prompt_cache.expires_at(),
-                chrono::DateTime::parse_from_rfc3339("2026-10-23T16:00:00Z")
-                    .unwrap()
-                    .to_utc()
+                prompt_cache,
+                &PromptCache::Window {
+                    last_request_at: request_at,
+                    ttl_seconds: 3600,
+                }
             );
+            assert_eq!(
+                prompt_cache.state(request_at + chrono::TimeDelta::minutes(20)),
+                PromptCacheState::Warm {
+                    time_left: chrono::TimeDelta::minutes(40)
+                }
+            );
+            assert_eq!(
+                prompt_cache.state(request_at - chrono::TimeDelta::minutes(20)),
+                PromptCacheState::Warm {
+                    time_left: chrono::TimeDelta::minutes(60)
+                }
+            );
+            assert_eq!(
+                prompt_cache.state(request_at + chrono::TimeDelta::minutes(75)),
+                PromptCacheState::Expired {
+                    idle: chrono::TimeDelta::minutes(75)
+                }
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(acp_v1::UsageUpdate::new(1000, 10000).meta(
+                        prompt_cache_meta(serde_json::json!({
+                            "compactedAt": "2026-10-23T15:30:00.000Z"
+                        })),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let prompt_cache = thread.prompt_cache().expect("prompt cache should be set");
+            assert_eq!(
+                prompt_cache.state(request_at + chrono::TimeDelta::minutes(35)),
+                PromptCacheState::Compacted {
+                    idle: chrono::TimeDelta::minutes(5)
+                }
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::UsageUpdate(
+                        acp_v1::UsageUpdate::new(1000, 10000)
+                            .meta(prompt_cache_meta(serde_json::Value::Null)),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.prompt_cache(), None);
         });
     }
 

@@ -9,7 +9,7 @@ use agent_client_protocol::schema::v2 as acp_v2;
 use std::{cell::RefCell, path::Path};
 
 use acp_thread::{
-    Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity,
+    Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, PromptCacheState,
     SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
     SubmissionId, SubmissionResponse, SubmissionState, ToolCallLocation, decode_path_escapes,
 };
@@ -621,7 +621,7 @@ pub struct ThreadView {
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
     _sandbox_status_refresh_task: Option<Task<()>>,
-    _prompt_cache_refresh_task: Option<Task<()>>,
+    _prompt_cache_refresh: Option<(chrono::DateTime<chrono::Utc>, Task<()>)>,
     pub hovered_edited_file_buttons: Option<usize>,
     pub current_submission: Option<SubmissionId>,
     pub _subscriptions: Vec<Subscription>,
@@ -1061,7 +1061,7 @@ impl ThreadView {
             _save_task: None,
             _draft_resolve_task: None,
             _sandbox_status_refresh_task: None,
-            _prompt_cache_refresh_task: None,
+            _prompt_cache_refresh: None,
             hovered_edited_file_buttons: None,
             current_submission,
             message_editor,
@@ -6383,22 +6383,14 @@ impl ThreadView {
     }
 
     fn render_prompt_cache_indicator(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let prompt_cache = self.thread.read(cx).prompt_cache()?.clone();
-        if self._prompt_cache_refresh_task.is_none() {
-            self._prompt_cache_refresh_task = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(15))
-                        .await;
-                    if this.update(cx, |_, cx| cx.notify()).is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
-
+        let Some(prompt_cache) = self.thread.read(cx).prompt_cache().cloned() else {
+            self._prompt_cache_refresh = None;
+            return None;
+        };
         let now = chrono::Utc::now();
-        let remaining = prompt_cache.expires_at() - now;
+        let state = prompt_cache.state(now);
+        self.schedule_prompt_cache_refresh(now, state, cx);
+
         let indicator = h_flex()
             .id("prompt-cache-indicator")
             .h_6()
@@ -6407,35 +6399,75 @@ impl ThreadView {
             .flex_none()
             .rounded_sm();
 
-        let element = if remaining > chrono::TimeDelta::zero() {
-            let minutes_left = (remaining.num_seconds() + 59) / 60;
-            let tooltip = format!("Prompt cache warm, about {minutes_left} min left.");
-            indicator
-                .child(
-                    Icon::new(IconName::Clock)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new(format!("{minutes_left}m"))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .tooltip(Tooltip::text(tooltip))
-                .into_any_element()
-        } else {
-            let idle = compact_duration(now - prompt_cache.last_request_at);
-            let tooltip = format!("Prompt cache likely expired (idle {idle}).");
-            indicator
-                .child(
-                    Icon::new(IconName::Clock)
-                        .size(IconSize::Small)
-                        .color(Color::Error),
-                )
-                .tooltip(Tooltip::text(tooltip))
-                .into_any_element()
+        let element = match state {
+            PromptCacheState::Warm { time_left } => {
+                let minutes_left = ceil_minutes(time_left);
+                let tooltip = format!("Prompt cache warm, about {minutes_left} min left.");
+                indicator
+                    .child(
+                        Icon::new(IconName::Clock)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("{minutes_left}m"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(tooltip))
+                    .into_any_element()
+            }
+            PromptCacheState::Expired { idle } => cold_prompt_cache_indicator(
+                indicator,
+                format!(
+                    "Prompt cache likely expired (idle {}).",
+                    idle_duration(idle)
+                ),
+            ),
+            PromptCacheState::Compacted { .. } => cold_prompt_cache_indicator(
+                indicator,
+                "Prompt cache does not cover the compacted conversation.".to_string(),
+            ),
         };
         Some(element)
+    }
+
+    fn schedule_prompt_cache_refresh(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+        state: PromptCacheState,
+        cx: &mut Context<Self>,
+    ) {
+        let minute = chrono::TimeDelta::minutes(1);
+        let delay = match state {
+            PromptCacheState::Warm { time_left } => {
+                time_left - minute * (ceil_minutes(time_left) - 1) as i32
+            }
+            PromptCacheState::Expired { idle } | PromptCacheState::Compacted { idle } => {
+                minute - chrono::TimeDelta::milliseconds(idle.num_milliseconds().rem_euclid(60_000))
+            }
+        };
+        let refresh_at = now + delay;
+        if self
+            ._prompt_cache_refresh
+            .as_ref()
+            .is_some_and(|(scheduled_at, _)| *scheduled_at == refresh_at)
+        {
+            return;
+        }
+        let delay = delay
+            .to_std()
+            .unwrap_or_default()
+            .max(Duration::from_millis(10));
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                this._prompt_cache_refresh = None;
+                cx.notify();
+            })
+            .ok();
+        });
+        self._prompt_cache_refresh = Some((refresh_at, task));
     }
 
     fn render_follow_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6502,6 +6534,29 @@ fn plan_usage_reset_label(resets_at: chrono::DateTime<chrono::Utc>) -> String {
         return "Reset".to_string();
     }
     compact_duration(remaining)
+}
+
+fn cold_prompt_cache_indicator(indicator: Stateful<Div>, tooltip: String) -> AnyElement {
+    indicator
+        .child(
+            Icon::new(IconName::Clock)
+                .size(IconSize::Small)
+                .color(Color::Error),
+        )
+        .tooltip(Tooltip::text(tooltip))
+        .into_any_element()
+}
+
+fn ceil_minutes(duration: chrono::TimeDelta) -> i64 {
+    (duration.num_milliseconds() + 59_999).div_euclid(60_000)
+}
+
+fn idle_duration(duration: chrono::TimeDelta) -> String {
+    if duration < chrono::TimeDelta::minutes(1) {
+        "0m".to_string()
+    } else {
+        compact_duration(duration)
+    }
 }
 
 fn compact_duration(duration: chrono::TimeDelta) -> String {
