@@ -15749,10 +15749,11 @@ mod tests {
         assert_eq!(absolute.path, respelled.path);
         thread.update(cx, |thread, cx| {
             let (index, call) = thread.tool_call(&id).expect("tool");
-            let (location, _) = thread.entries[index]
+            let (location, agent_location) = thread.entries[index]
                 .location(0)
                 .expect("resolved location");
             assert_eq!(location, absolute);
+            assert!(agent_location.is_some());
             let resolved_locations = call.resolved_locations.clone();
             thread
                 .upsert_wire_tool_call(acp_v2::ToolCallUpdate::new("location-migration"), cx)
@@ -15776,15 +15777,20 @@ mod tests {
             let (index, call) = thread.tool_call(&id).expect("tool");
             assert_eq!(call.locations, vec![respelled.clone()]);
             assert!(call.resolved_locations.is_empty());
-            assert!(thread.entries[index].location(0).is_none());
+            let (location, agent_location) = thread.entries[index]
+                .location(0)
+                .expect("unresolved location");
+            assert_eq!(location, respelled);
+            assert!(agent_location.is_none());
         });
         cx.run_until_parked();
         thread.update(cx, |thread, cx| {
             let (index, _) = thread.tool_call(&id).expect("tool");
-            let (location, _) = thread.entries[index]
+            let (location, agent_location) = thread.entries[index]
                 .location(0)
                 .expect("refreshed projection");
             assert_eq!(location, respelled);
+            assert!(agent_location.is_some());
             thread
                 .update_tool_call(
                     acp_v1::ToolCallUpdate::new(
@@ -15801,7 +15807,11 @@ mod tests {
             let (index, call) = thread.tool_call(&id).expect("tool");
             assert_eq!(call.locations, vec![relative.clone()]);
             assert!(call.resolved_locations.is_empty());
-            assert!(thread.entries[index].location(0).is_none());
+            let (location, agent_location) = thread.entries[index]
+                .location(0)
+                .expect("unresolved location");
+            assert_eq!(location, relative);
+            assert!(agent_location.is_none());
         });
         cx.run_until_parked();
         thread.update(cx, |thread, cx| {
