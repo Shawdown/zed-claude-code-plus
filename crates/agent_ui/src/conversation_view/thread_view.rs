@@ -9228,12 +9228,13 @@ impl ThreadView {
                     ))
                 }
             })
-            .children(self.render_run_in_background(tool_call, cx))
+            .children(self.render_run_in_background(tool_call, layout, cx))
     }
 
     fn render_run_in_background(
         &self,
         tool_call: &ToolCall,
+        layout: ToolCallLayout,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         use acp_thread::RunInBackgroundOutcome;
@@ -9270,8 +9271,8 @@ impl ThreadView {
 
         Some(
             h_flex()
-                .px_2()
-                .pt_1()
+                .when(layout == ToolCallLayout::Standalone, |this| this.mx_5())
+                .mb_1p5()
                 .gap_2()
                 .flex_wrap()
                 .when_some(message, |this, message| {
