@@ -2152,6 +2152,24 @@ impl AgentConnection for AcpConnection {
         }))
     }
 
+    fn run_in_background(
+        &self,
+        session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionRunInBackground>> {
+        let capability = self.claude_code_plus_capability("runInBackground")?;
+        let method = capability
+            .get("method")
+            .and_then(|method| method.as_str())
+            .unwrap_or(DEFAULT_RUN_IN_BACKGROUND_METHOD)
+            .to_string();
+        Some(Rc::new(AcpSessionRunInBackground {
+            connection: self.connection.clone(),
+            session_id: session_id.clone(),
+            method,
+        }))
+    }
+
     fn starts_new_thread_for_command(&self, command_name: &str) -> bool {
         self.claude_code_plus_capability("newThreadCommands")
             .and_then(|capability| capability.get("commands"))
@@ -2225,6 +2243,7 @@ impl AgentConnection for AcpConnection {
 
 const CLAUDE_CODE_PLUS_META_KEY: &str = "claudeCodePlus";
 const DEFAULT_TRUNCATE_METHOD: &str = "_claudeCodePlus/truncate";
+const DEFAULT_RUN_IN_BACKGROUND_METHOD: &str = "_claudeCodePlus/runInBackground";
 
 fn send_prompt(
     conn: ConnectionTo<Agent>,
@@ -2341,6 +2360,48 @@ impl acp_thread::AgentSessionTruncate for AcpSessionTruncate {
                 .await
                 .map_err(map_acp_error)?;
             Ok(())
+        })
+    }
+}
+
+struct AcpSessionRunInBackground {
+    connection: ConnectionTo<Agent>,
+    session_id: acp_v2::SessionId,
+    method: String,
+}
+
+#[derive(Deserialize)]
+struct RunInBackgroundResponse {
+    outcome: acp_thread::RunInBackgroundOutcome,
+}
+
+impl acp_thread::AgentSessionRunInBackground for AcpSessionRunInBackground {
+    fn run(
+        &self,
+        tool_call_ids: Vec<acp_v2::ToolCallId>,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::RunInBackgroundOutcome>> {
+        let tool_call_ids = tool_call_ids
+            .iter()
+            .map(|id| id.0.to_string())
+            .collect::<Vec<_>>();
+        let request = UntypedMessage::new(
+            &self.method,
+            serde_json::json!({
+                "sessionId": self.session_id.0.as_ref(),
+                "toolCallIds": tool_call_ids,
+            }),
+        );
+        let conn = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let request = request.map_err(map_acp_error)?;
+            let response = conn
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            let response: RunInBackgroundResponse = serde_json::from_value(response)?;
+            Ok(response.outcome)
         })
     }
 }
@@ -2630,6 +2691,14 @@ pub mod test_support {
             cx: &App,
         ) -> Option<Rc<dyn AgentSessionTruncate>> {
             self.inner.truncate(session_id, cx)
+        }
+
+        fn run_in_background(
+            &self,
+            session_id: &acp_v2::SessionId,
+            cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionRunInBackground>> {
+            self.inner.run_in_background(session_id, cx)
         }
 
         fn set_title(

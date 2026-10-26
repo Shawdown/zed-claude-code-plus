@@ -567,6 +567,12 @@ impl PermissionSelection {
     }
 }
 
+#[derive(Default)]
+struct RunInBackgroundState {
+    pending: bool,
+    outcome: Option<acp_thread::RunInBackgroundOutcome>,
+}
+
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp_v2::SessionId,
@@ -603,6 +609,8 @@ pub struct ThreadView {
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
     acknowledged_confusable_warnings: HashSet<acp_v2::ToolCallId>,
+    run_in_background_states: HashMap<acp_v2::ToolCallId, RunInBackgroundState>,
+    background_tasks_refused: bool,
     pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
@@ -1044,6 +1052,8 @@ impl ThreadView {
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
+            run_in_background_states: HashMap::default(),
+            background_tasks_refused: false,
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
@@ -9174,47 +9184,164 @@ impl ThreadView {
             layout.id_str()
         )));
 
-        div().w_full().id(container_id).map(|this| {
-            if tool_call.is_subagent() {
-                this.child(
-                    self.render_subagent_tool_call(
+        div()
+            .w_full()
+            .id(container_id)
+            .map(|this| {
+                if tool_call.is_subagent() {
+                    this.child(
+                        self.render_subagent_tool_call(
+                            active_session_id,
+                            entry_ix,
+                            tool_call,
+                            tool_call
+                                .subagent_session_info
+                                .as_ref()
+                                .map(|i| i.session_id.clone()),
+                            focus_handle,
+                            window,
+                            cx,
+                        ),
+                    )
+                } else if has_terminals {
+                    this.children(tool_call.terminals().map(|terminal| {
+                        self.render_terminal_tool_call(
+                            active_session_id,
+                            entry_ix,
+                            terminal,
+                            tool_call,
+                            focus_handle,
+                            layout,
+                            window,
+                            cx,
+                        )
+                    }))
+                } else {
+                    this.child(self.render_tool_call(
                         active_session_id,
                         entry_ix,
-                        tool_call,
-                        tool_call
-                            .subagent_session_info
-                            .as_ref()
-                            .map(|i| i.session_id.clone()),
-                        focus_handle,
-                        window,
-                        cx,
-                    ),
-                )
-            } else if has_terminals {
-                this.children(tool_call.terminals().map(|terminal| {
-                    self.render_terminal_tool_call(
-                        active_session_id,
-                        entry_ix,
-                        terminal,
                         tool_call,
                         focus_handle,
                         layout,
                         window,
                         cx,
-                    )
-                }))
-            } else {
-                this.child(self.render_tool_call(
-                    active_session_id,
-                    entry_ix,
-                    tool_call,
-                    focus_handle,
-                    layout,
-                    window,
-                    cx,
-                ))
+                    ))
+                }
+            })
+            .children(self.render_run_in_background(tool_call, cx))
+    }
+
+    fn render_run_in_background(
+        &self,
+        tool_call: &ToolCall,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        use acp_thread::RunInBackgroundOutcome;
+
+        if !tool_call.runs_in_foreground
+            || !matches!(
+                tool_call.status(),
+                ToolCallStatus::Pending | ToolCallStatus::InProgress
+            )
+        {
+            return None;
+        }
+        let state = self.run_in_background_states.get(&tool_call.id);
+        let outcome = state.and_then(|state| state.outcome);
+        if outcome == Some(RunInBackgroundOutcome::Moved)
+            || (outcome.is_none() && self.background_tasks_refused)
+        {
+            return None;
+        }
+        let message = match outcome {
+            Some(RunInBackgroundOutcome::NotFound) => Some(
+                "Could not move this to the background. It may have just finished or already be running in the background.",
+            ),
+            Some(RunInBackgroundOutcome::Disabled) => {
+                Some("Moving to the background is turned off for this session.")
             }
+            Some(RunInBackgroundOutcome::Failed) => {
+                Some("Could not move this to the background. Try again.")
+            }
+            Some(RunInBackgroundOutcome::Moved) | None => None,
+        };
+        let show_button = matches!(outcome, None | Some(RunInBackgroundOutcome::Failed));
+        let tool_call_id = tool_call.id.clone();
+
+        Some(
+            h_flex()
+                .px_2()
+                .pt_1()
+                .gap_2()
+                .flex_wrap()
+                .when_some(message, |this, message| {
+                    this.child(
+                        Label::new(message)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .when(show_button, |this| {
+                    this.child(
+                        Button::new(
+                            SharedString::from(format!("run-in-background-{}", tool_call_id.0)),
+                            "Run in background",
+                        )
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.run_in_background(tool_call_id.clone(), cx);
+                        })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn run_in_background(&mut self, tool_call_id: acp_v2::ToolCallId, cx: &mut Context<Self>) {
+        if self
+            .run_in_background_states
+            .get(&tool_call_id)
+            .is_some_and(|state| state.pending)
+        {
+            return;
+        }
+        let Some(run_in_background) = self
+            .thread
+            .read(cx)
+            .connection()
+            .run_in_background(&self.session_id, cx)
+        else {
+            return;
+        };
+        self.run_in_background_states.insert(
+            tool_call_id.clone(),
+            RunInBackgroundState {
+                pending: true,
+                outcome: None,
+            },
+        );
+        cx.notify();
+        let task = run_in_background.run(vec![tool_call_id.clone()], cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await.unwrap_or_else(|error| {
+                log::error!("Failed to move a tool call to the background: {error:#}");
+                acp_thread::RunInBackgroundOutcome::Failed
+            });
+            this.update(cx, |this, cx| {
+                this.run_in_background_states.insert(
+                    tool_call_id,
+                    RunInBackgroundState {
+                        pending: false,
+                        outcome: Some(outcome),
+                    },
+                );
+                if outcome == acp_thread::RunInBackgroundOutcome::Disabled {
+                    this.background_tasks_refused = true;
+                }
+                cx.notify();
+            })
         })
+        .detach_and_log_err(cx);
     }
 
     fn render_tool_call(

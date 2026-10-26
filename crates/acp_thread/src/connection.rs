@@ -255,6 +255,14 @@ pub trait AgentConnection {
         false
     }
 
+    fn run_in_background(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentSessionRunInBackground>> {
+        None
+    }
+
     fn set_title(
         &self,
         _session_id: &acp_v2::SessionId,
@@ -309,6 +317,23 @@ impl dyn AgentConnection {
 
 pub trait AgentSessionTruncate {
     fn run(&self, client_user_message_id: ClientUserMessageId, cx: &mut App) -> Task<Result<()>>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInBackgroundOutcome {
+    Moved,
+    NotFound,
+    Disabled,
+    Failed,
+}
+
+pub trait AgentSessionRunInBackground {
+    fn run(
+        &self,
+        tool_call_ids: Vec<acp_v2::ToolCallId>,
+        cx: &mut App,
+    ) -> Task<Result<RunInBackgroundOutcome>>;
 }
 
 pub trait AgentSessionClientUserMessageIds {

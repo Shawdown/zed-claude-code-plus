@@ -277,6 +277,14 @@ pub fn meta_with_sandbox_not_applied(reason: &SandboxNotAppliedReason) -> acp_v2
     )])
 }
 
+pub const RUN_IN_BACKGROUND_META_KEY: &str = "claudeCodePlus/runInBackground";
+
+pub fn runs_in_foreground_from_meta(meta: &Option<acp_v2::Meta>) -> Option<bool> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(RUN_IN_BACKGROUND_META_KEY))
+        .and_then(|value| value.as_bool())
+}
+
 pub fn sandbox_not_applied_from_meta(
     meta: &Option<acp_v2::Meta>,
 ) -> Option<SandboxNotAppliedReason> {
@@ -1076,6 +1084,7 @@ pub struct ToolCall {
     /// sandboxing was active (see [`SANDBOX_NOT_APPLIED_META_KEY`]). `None` when
     /// the command was sandboxed normally (or sandboxing was off).
     pub sandbox_not_applied: Option<SandboxNotAppliedReason>,
+    pub runs_in_foreground: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1320,6 +1329,7 @@ impl ToolCall {
         let sandbox_fallback_authorization_details =
             sandbox_fallback_authorization_details_from_meta(&meta);
         let sandbox_not_applied = sandbox_not_applied_from_meta(&meta);
+        let runs_in_foreground = runs_in_foreground_from_meta(&meta).unwrap_or(false);
         let label = Self::new_label(
             title.as_ref().filter(|title| !title.trim().is_empty()),
             tool_name.as_ref(),
@@ -1350,6 +1360,7 @@ impl ToolCall {
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
+            runs_in_foreground,
         };
         result.update_raw_output_content(&language_registry, cx);
         Ok(result)
@@ -1503,6 +1514,9 @@ impl ToolCall {
                 if let Some(value) = sandbox_not_applied_from_meta(&meta) {
                     self.sandbox_not_applied = Some(value);
                 }
+                if let Some(value) = runs_in_foreground_from_meta(&meta) {
+                    self.runs_in_foreground = value;
+                }
                 if meta.is_some() {
                     self.meta = meta;
                 }
@@ -1517,6 +1531,8 @@ impl ToolCall {
                     self.sandbox_fallback_authorization_details =
                         sandbox_fallback_authorization_details_from_meta(&self.meta);
                     self.sandbox_not_applied = sandbox_not_applied_from_meta(&self.meta);
+                    self.runs_in_foreground =
+                        runs_in_foreground_from_meta(&self.meta).unwrap_or(false);
                 }
                 if name_changed || meta_changed {
                     self.tool_name = self
@@ -8012,6 +8028,23 @@ mod tests {
         previous_markdown.read_with(cx, |markdown, _| {
             assert_eq!(markdown.source(), "before buffered late");
         });
+    }
+
+    #[test]
+    fn runs_in_foreground_reads_the_run_in_background_meta_key() {
+        let meta = |value: serde_json::Value| {
+            Some(acp_v2::Meta::from_iter([(
+                RUN_IN_BACKGROUND_META_KEY.into(),
+                value,
+            )]))
+        };
+        assert_eq!(runs_in_foreground_from_meta(&meta(true.into())), Some(true));
+        assert_eq!(
+            runs_in_foreground_from_meta(&meta(false.into())),
+            Some(false)
+        );
+        assert_eq!(runs_in_foreground_from_meta(&meta("yes".into())), None);
+        assert_eq!(runs_in_foreground_from_meta(&None), None);
     }
 
     #[test]
