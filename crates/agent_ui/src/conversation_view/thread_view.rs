@@ -1847,12 +1847,22 @@ impl ThreadView {
                 .starts_new_thread_for_command(command_name)
         {
             message_editor.update(cx, |editor, cx| editor.clear(window, cx));
+            let title = ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(self.root_thread_id)?.title())
+                .or_else(|| thread.read(cx).title());
             window.dispatch_action(
                 Box::new(crate::NewExternalAgentThread {
                     agent: self.agent_id.clone(),
                 }),
                 cx,
             );
+            if let Some(title) = title {
+                let workspace = self.workspace.clone();
+                let previous_thread_id = self.root_thread_id;
+                window.defer(cx, move |window, cx| {
+                    Self::name_new_thread(workspace, previous_thread_id, title, window, cx);
+                });
+            }
             return;
         }
 
@@ -2927,6 +2937,37 @@ impl ThreadView {
             }
             _ => {}
         }
+    }
+
+    fn name_new_thread(
+        workspace: WeakEntity<Workspace>,
+        previous_thread_id: ThreadId,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(conversation_view) = workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+            .and_then(|panel| panel.read(cx).active_conversation_view().cloned())
+        else {
+            return;
+        };
+        let thread_id = conversation_view.read(cx).thread_id;
+        if thread_id == previous_thread_id {
+            return;
+        }
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.set_title_override(thread_id, title.clone(), cx);
+            });
+        }
+        if let Some(thread_view) = conversation_view.read(cx).root_thread_view() {
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.sync_title_editor(title, window, cx);
+            });
+        }
+        conversation_view.update(cx, |_, cx| cx.notify());
     }
 
     /// Renames the thread, mirroring the editor text and persisting the new

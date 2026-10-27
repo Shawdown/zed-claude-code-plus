@@ -508,6 +508,7 @@ pub struct ThreadMetadataStore {
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
+    pending_title_overrides: HashMap<ThreadId, SharedString>,
     _db_operations_task: Task<()>,
 }
 
@@ -707,6 +708,8 @@ impl ThreadMetadataStore {
         cx: &mut Context<Self>,
     ) {
         let Some(existing) = self.entry(thread_id) else {
+            self.pending_title_overrides
+                .insert(thread_id, title_override);
             return;
         };
         if existing.title_override.as_ref() == Some(&title_override) {
@@ -1139,6 +1142,7 @@ impl ThreadMetadataStore {
     }
 
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.pending_title_overrides.remove(&thread_id);
         if let Some(thread) = self.threads.get(&thread_id) {
             if let Some(sid) = &thread.session_id {
                 self.threads_by_session.remove(sid);
@@ -1246,6 +1250,7 @@ impl ThreadMetadataStore {
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
+            pending_title_overrides: HashMap::default(),
             _db_operations_task,
         };
         let _ = this.reload(cx);
@@ -1290,7 +1295,9 @@ impl ThreadMetadataStore {
             Some(thread_ref.session_id().clone())
         };
         let title = thread_ref.title();
-        let title_override = existing_thread.and_then(|t| t.title_override.clone());
+        let title_override = existing_thread
+            .and_then(|t| t.title_override.clone())
+            .or_else(|| self.pending_title_overrides.get(&thread_id).cloned());
 
         let updated_at = Utc::now();
 
@@ -1353,6 +1360,7 @@ impl ThreadMetadataStore {
             archived,
         };
 
+        self.pending_title_overrides.remove(&thread_id);
         self.save(metadata, cx);
     }
 }
@@ -2756,6 +2764,56 @@ mod tests {
                 store.entry(thread_id).unwrap().session_id.as_ref(),
                 Some(&session_id),
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_title_override_set_before_entry_exists_applies_on_creation(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None::<&Path>, cx).await;
+        let connection = StubAgentConnection::new();
+
+        let (panel, mut vcx) = setup_panel_with_project(project, cx);
+        crate::test_support::open_thread_with_connection(&panel, connection, &mut vcx);
+
+        let thread = panel.read_with(&vcx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+        let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.delete(thread_id, cx);
+                store.set_title_override(thread_id, "Previous Thread".into(), cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        cx.read(|cx| {
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .is_none()
+            );
+        });
+
+        thread.update_in(&mut vcx, |thread, _window, cx| {
+            thread.set_title("Agent Title".into(), cx).detach();
+        });
+        vcx.run_until_parked();
+
+        cx.read(|cx| {
+            let store = ThreadMetadataStore::global(cx).read(cx);
+            let entry = store.entry(thread_id).expect("metadata row");
+            assert_eq!(
+                entry.title_override.as_ref().map(|t| t.as_ref()),
+                Some("Previous Thread")
+            );
+            assert_eq!(entry.title().as_deref(), Some("Previous Thread"));
+            assert!(store.pending_title_overrides.is_empty());
         });
     }
 
