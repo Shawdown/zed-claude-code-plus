@@ -1253,18 +1253,45 @@ impl Dock {
         panel_key: &'static str,
         cx: &App,
     ) -> Option<PanelSizeState> {
-        let workspace_id = workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())?;
         let kvp = KeyValueStore::global(cx);
         let scope = kvp.scoped(PANEL_SIZE_STATE_KEY);
-        scope
-            .read(&format!("{workspace_id}:{panel_key}"))
-            .log_err()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
+        let read = |key: &str| {
+            scope
+                .read(key)
+                .log_err()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
+        };
+        read(&shared_panel_size_state_key(panel_key)).or_else(|| {
+            let workspace_id = workspace
+                .database_id()
+                .map(|id| i64::from(id).to_string())
+                .or(workspace.session_id())?;
+            read(&format!("{workspace_id}:{panel_key}"))
+        })
     }
+
+    pub(crate) fn sync_panel_size_state(
+        &mut self,
+        panel_key: &str,
+        size_state: PanelSizeState,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for entry in &mut self.panel_entries {
+            if entry.panel.panel_key() == panel_key && entry.size_state != size_state {
+                entry.size_state = size_state;
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+}
+
+pub(crate) fn shared_panel_size_state_key(panel_key: &str) -> String {
+    format!("shared:{panel_key}")
 }
 
 impl Render for Dock {
