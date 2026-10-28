@@ -51,6 +51,7 @@ pub struct EntryViewState {
     expanded_thinking_blocks: HashSet<(usize, usize)>,
     auto_expanded_thinking_block: Option<(usize, usize)>,
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
+    thinking_display_override: Option<ThinkingBlockDisplay>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
 }
@@ -73,6 +74,7 @@ impl EntryViewState {
             expanded_thinking_blocks: HashSet::default(),
             auto_expanded_thinking_block: None,
             user_toggled_thinking_blocks: HashSet::default(),
+            thinking_display_override: None,
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
         }
@@ -114,6 +116,29 @@ impl EntryViewState {
         }
     }
 
+    pub(crate) fn thinking_display(&self, cx: &App) -> ThinkingBlockDisplay {
+        self.thinking_display_override
+            .unwrap_or(AgentSettings::get_global(cx).thinking_display)
+    }
+
+    pub(crate) fn thinking_display_override(&self) -> Option<ThinkingBlockDisplay> {
+        self.thinking_display_override
+    }
+
+    pub(crate) fn set_thinking_display_override(
+        &mut self,
+        thinking_display_override: Option<ThinkingBlockDisplay>,
+    ) {
+        if self.thinking_display_override == thinking_display_override {
+            return;
+        }
+        self.thinking_display_override = thinking_display_override;
+        self.user_toggled_thinking_blocks.clear();
+        let streaming_block = self.auto_expanded_thinking_block;
+        self.expanded_thinking_blocks
+            .retain(|key| Some(*key) == streaming_block);
+    }
+
     pub(crate) fn clear_auto_expand_tracking(&mut self) {
         self.auto_expanded_thinking_block = None;
     }
@@ -123,7 +148,7 @@ impl EntryViewState {
     }
 
     pub(crate) fn auto_expand_streaming_thought(&mut self, thread: &AcpThread, cx: &App) -> bool {
-        let thinking_display = AgentSettings::get_global(cx).thinking_display;
+        let thinking_display = self.thinking_display(cx);
 
         if !matches!(
             thinking_display,
@@ -164,7 +189,7 @@ impl EntryViewState {
     }
 
     pub(crate) fn toggle_thinking_block_expansion(&mut self, key: (usize, usize), cx: &App) {
-        match AgentSettings::get_global(cx).thinking_display {
+        match self.thinking_display(cx) {
             ThinkingBlockDisplay::Auto => {
                 let is_open = self.expanded_thinking_blocks.contains(&key)
                     || self.user_toggled_thinking_blocks.contains(&key);
@@ -214,7 +239,7 @@ impl EntryViewState {
         let is_user_toggled = self.user_toggled_thinking_blocks.contains(&key);
         let is_in_expanded_set = self.expanded_thinking_blocks.contains(&key);
 
-        match AgentSettings::get_global(cx).thinking_display {
+        match self.thinking_display(cx) {
             ThinkingBlockDisplay::Auto => {
                 let is_open = is_user_toggled || is_in_expanded_set;
                 (is_open, false)
@@ -828,7 +853,7 @@ mod tests {
     use pretty_assertions::assert_matches;
     use project::Project;
     use serde_json::json;
-    use settings::SettingsStore;
+    use settings::{SettingsStore, ThinkingBlockDisplay};
     use util::path;
     use workspace::{MultiWorkspace, PathList};
 
@@ -1027,6 +1052,52 @@ mod tests {
                 view_state.entry(1),
                 Some(Entry::AssistantMessage(_))
             ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thinking_display_override(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let view_state = cx.new(|_cx| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+
+        let block = (0, 0);
+        view_state.update(cx, |view_state, cx| {
+            assert_eq!(view_state.thinking_display(cx), ThinkingBlockDisplay::Auto);
+            assert_eq!(view_state.thinking_block_state(block, cx), (false, false));
+
+            view_state.toggle_thinking_block_expansion(block, cx);
+            assert_eq!(view_state.thinking_block_state(block, cx), (true, false));
+
+            view_state.set_thinking_display_override(Some(ThinkingBlockDisplay::AlwaysExpanded));
+            assert_eq!(
+                view_state.thinking_display_override(),
+                Some(ThinkingBlockDisplay::AlwaysExpanded)
+            );
+            assert_eq!(
+                view_state.thinking_display(cx),
+                ThinkingBlockDisplay::AlwaysExpanded
+            );
+            assert_eq!(view_state.thinking_block_state(block, cx), (true, false));
+
+            view_state.set_thinking_display_override(None);
+            assert_eq!(view_state.thinking_display(cx), ThinkingBlockDisplay::Auto);
+            assert_eq!(view_state.thinking_block_state(block, cx), (false, false));
         });
     }
 

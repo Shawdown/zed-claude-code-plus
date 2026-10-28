@@ -5728,6 +5728,22 @@ impl AgentPanel {
                                 let root_thread_view =
                                     conversation_view.read(cx).root_thread_view();
                                 if let Some(thread_view) = root_thread_view {
+                                    let expands_thinking_blocks =
+                                        thread_view.read(cx).expands_thinking_blocks(cx);
+                                    menu = menu.toggleable_entry(
+                                        "Expand Thinking Blocks",
+                                        expands_thinking_blocks,
+                                        IconPosition::End,
+                                        None,
+                                        {
+                                            let thread_view = thread_view.clone();
+                                            move |_window, cx| {
+                                                thread_view.update(cx, |thread_view, cx| {
+                                                    thread_view.toggle_expand_thinking_blocks(cx);
+                                                });
+                                            }
+                                        },
+                                    );
                                     let workspace = workspace.clone();
                                     menu = menu.entry("Open Thread as Markdown", None, {
                                         move |window, cx| {

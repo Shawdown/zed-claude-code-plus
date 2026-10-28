@@ -8309,6 +8309,27 @@ impl ThreadView {
         }
     }
 
+    pub(crate) fn expands_thinking_blocks(&self, cx: &App) -> bool {
+        self.entry_view_state.read(cx).thinking_display(cx)
+            == settings::ThinkingBlockDisplay::AlwaysExpanded
+    }
+
+    pub(crate) fn toggle_expand_thinking_blocks(&mut self, cx: &mut Context<Self>) {
+        let expand = !self.expands_thinking_blocks(cx);
+        let global_expands = AgentSettings::get_global(cx).thinking_display
+            == settings::ThinkingBlockDisplay::AlwaysExpanded;
+        let thinking_display_override = match (expand, global_expands) {
+            (true, false) => Some(settings::ThinkingBlockDisplay::AlwaysExpanded),
+            (false, true) => Some(settings::ThinkingBlockDisplay::Auto),
+            (true, true) | (false, false) => None,
+        };
+        self.entry_view_state.update(cx, |entry_view_state, _cx| {
+            entry_view_state.set_thinking_display_override(thinking_display_override);
+        });
+        set_thread_thinking_display_override(&self.session_id, thinking_display_override, cx);
+        cx.notify();
+    }
+
     pub fn open_thread_as_markdown(
         &self,
         workspace: Entity<Workspace>,
@@ -15384,6 +15405,47 @@ mod tests {
 
         fn flush(&self) {}
     }
+}
+
+const THREAD_THINKING_DISPLAY_NAMESPACE: &str = "thread-thinking-display";
+
+pub(crate) fn thread_thinking_display_override(
+    session_id: &acp_v2::SessionId,
+    cx: &App,
+) -> Option<settings::ThinkingBlockDisplay> {
+    let value = KeyValueStore::global(cx)
+        .scoped(THREAD_THINKING_DISPLAY_NAMESPACE)
+        .read(&session_id.to_string())
+        .log_err()
+        .flatten()?;
+    serde_json::from_str(&value).log_err()
+}
+
+fn set_thread_thinking_display_override(
+    session_id: &acp_v2::SessionId,
+    thinking_display_override: Option<settings::ThinkingBlockDisplay>,
+    cx: &mut App,
+) {
+    let key = session_id.to_string();
+    let value = match thinking_display_override
+        .map(|thinking_display| serde_json::to_string(&thinking_display))
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("failed to serialize thinking display override: {error}");
+            return;
+        }
+    };
+    let kvp = KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        let store = kvp.scoped(THREAD_THINKING_DISPLAY_NAMESPACE);
+        match value {
+            Some(value) => store.write(key, value).await.log_err(),
+            None => store.delete(key).await.log_err(),
+        };
+    })
+    .detach();
 }
 
 const FAST_MODE_WARNING_NAMESPACE: &str = "fast-mode-warning-dismissed";

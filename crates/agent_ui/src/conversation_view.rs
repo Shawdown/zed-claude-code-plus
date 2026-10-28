@@ -1484,6 +1484,12 @@ impl ConversationView {
             )
         });
 
+        if let Some(thinking_display_override) = thread_thinking_display_override(&session_id, cx) {
+            entry_view_state.update(cx, |view_state, _cx| {
+                view_state.set_thinking_display_override(Some(thinking_display_override));
+            });
+        }
+
         let count = thread.read(cx).entries().len();
         let list_state = ListState::new(0, gpui::ListAlignment::Top, px(2048.0));
         list_state.set_follow_mode(gpui::FollowMode::Tail);
