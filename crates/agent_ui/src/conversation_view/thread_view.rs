@@ -8078,6 +8078,97 @@ impl ThreadView {
         }
     }
 
+    fn render_user_message_markers(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        const MARKER_TRACK_PADDING: Pixels = px(4.);
+        const MINIMUM_THUMB_SIZE: Pixels = px(25.);
+
+        let max_offset = self.list_state.max_offset_for_scrollbar().y;
+        let viewport_height = self.list_state.viewport_bounds().size.height;
+        if max_offset <= Pixels::ZERO || viewport_height <= Pixels::ZERO {
+            return None;
+        }
+        let content_height = viewport_height + max_offset;
+        let thumb_height =
+            MINIMUM_THUMB_SIZE.max(viewport_height * (viewport_height / content_height));
+        if thumb_height > viewport_height {
+            return None;
+        }
+        let thumb_travel = (viewport_height - thumb_height) / viewport_height;
+
+        let user_message_indices = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let last_user_message_index = *user_message_indices.last()?;
+
+        let colors = cx.theme().colors();
+        let marker_color = colors.text_muted.opacity(0.7);
+        let latest_marker_color = colors.text_accent;
+        let hover_color = colors.text_accent;
+
+        let markers = user_message_indices.into_iter().filter_map(|entry_ix| {
+            let item_offset = self.list_state.item_offset_for_scrollbar(entry_ix)?;
+            let position = (item_offset / max_offset).clamp(0., 1.) * thumb_travel;
+            let color = if entry_ix == last_user_message_index {
+                latest_marker_color
+            } else {
+                marker_color
+            };
+            let thread = self.thread.downgrade();
+            Some(
+                div()
+                    .id(("user-message-marker", entry_ix))
+                    .group("user-message-marker")
+                    .absolute()
+                    .top(relative(position))
+                    .left_0()
+                    .right_0()
+                    .h(px(7.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .occlude()
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(3.))
+                            .rounded_xs()
+                            .bg(color)
+                            .group_hover("user-message-marker", |style| style.bg(hover_color)),
+                    )
+                    .tooltip(move |_window, cx| {
+                        let preview = thread
+                            .read_with(cx, |thread, cx| {
+                                user_message_preview(thread.entries().get(entry_ix)?, cx)
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "Your message".into());
+                        Tooltip::simple(preview, cx)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_user_message_index(Some(entry_ix), cx);
+                    })),
+            )
+        });
+
+        Some(
+            div()
+                .absolute()
+                .top(MARKER_TRACK_PADDING)
+                .bottom(MARKER_TRACK_PADDING)
+                .right(px(3.))
+                .w(px(8.))
+                .children(markers)
+                .into_any_element(),
+        )
+    }
+
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
         self.list_state.scroll_to_end();
         cx.notify();
@@ -13626,6 +13717,7 @@ impl Render for ThreadView {
                         .size_full()
                         .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
+                        .children(self.render_user_message_markers(cx))
                         .into_any()
                 } else {
                     this.into_any()
@@ -15495,4 +15587,25 @@ pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
             .log_err();
     })
     .detach();
+}
+
+fn user_message_preview(entry: &AgentThreadEntry, cx: &App) -> Option<SharedString> {
+    const MAX_PREVIEW_CHARS: usize = 120;
+
+    let AgentThreadEntry::UserMessage(message) = entry else {
+        return None;
+    };
+    let markdown = message.content.to_markdown(cx);
+    let first_line = markdown
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut preview = first_line
+        .chars()
+        .take(MAX_PREVIEW_CHARS)
+        .collect::<String>();
+    if first_line.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push('…');
+    }
+    Some(preview.into())
 }

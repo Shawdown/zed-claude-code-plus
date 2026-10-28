@@ -795,6 +795,18 @@ impl ListState {
         Point::new(px(0.), -offset)
     }
 
+    /// Returns the scroll offset at which the item at `ix` would sit at the top of the
+    /// viewport, based on the item heights measured so far.
+    pub fn item_offset_for_scrollbar(&self, ix: usize) -> Option<Pixels> {
+        let state = &self.0.borrow();
+        if ix >= state.items.summary().count {
+            return None;
+        }
+        let mut cursor = state.items.cursor::<ListItemSummary>(());
+        let summary: ListItemSummary = cursor.summary(&Count(ix), Bias::Right);
+        Some(summary.height)
+    }
+
     /// Return the bounds of the viewport in pixels.
     pub fn viewport_bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().last_layout_bounds.unwrap_or_default()

@@ -121,6 +121,7 @@ impl EntryViewState {
             .unwrap_or(AgentSettings::get_global(cx).thinking_display)
     }
 
+    #[cfg(test)]
     pub(crate) fn thinking_display_override(&self) -> Option<ThinkingBlockDisplay> {
         self.thinking_display_override
     }
