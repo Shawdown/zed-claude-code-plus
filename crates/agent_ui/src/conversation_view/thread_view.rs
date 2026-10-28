@@ -43,7 +43,7 @@ use language_model::{
 };
 use notifications::status_toast::StatusToast;
 use project::ResolvedPath;
-use settings::{update_settings_file, update_settings_file_with_completion};
+use settings::{SettingsStore, update_settings_file, update_settings_file_with_completion};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
@@ -818,6 +818,7 @@ impl ThreadView {
 
         subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_global::<SettingsStore>(|_, cx| cx.notify()));
 
         let has_slash_completions = session_capabilities.read().has_slash_completions();
         let placeholder = placeholder_text(agent_display_name.as_ref(), has_slash_completions);
@@ -5130,8 +5131,14 @@ impl ThreadView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_0p5()
-                                    .child(self.render_add_context_button(cx))
-                                    .child(self.render_follow_toggle(cx))
+                                    .when(
+                                        AgentSettings::get_global(cx).show_add_context_button,
+                                        |this| this.child(self.render_add_context_button(cx)),
+                                    )
+                                    .when(
+                                        AgentSettings::get_global(cx).show_follow_button,
+                                        |this| this.child(self.render_follow_toggle(cx)),
+                                    )
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx))
                                     .children(self.render_prompt_cache_indicator(cx)),

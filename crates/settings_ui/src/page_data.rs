@@ -9284,6 +9284,44 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Add Context Button",
+                description: "Whether to show the Add Context button in the agent message editor.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.show_add_context_button"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.show_add_context_button.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .show_add_context_button = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Follow Button",
+                description: "Whether to show the Follow Agent button in the agent message editor.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.show_follow_button"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.show_follow_button.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .show_follow_button = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Show Merge Conflict Indicator",
                 description: "Whether to show the merge conflict indicator in the status bar that offers to resolve conflicts using the agent.",
                 field: Box::new(SettingField {

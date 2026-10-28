@@ -394,6 +394,19 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub show_turn_stats: Option<bool>,
+    /// Whether to show the "Add Context" button in the agent message editor.
+    ///
+    /// Default: true
+    pub show_add_context_button: Option<bool>,
+    /// Whether to show the "Follow Agent" button in the agent message editor.
+    ///
+    /// Default: true
+    pub show_follow_button: Option<bool>,
+    /// IDs of external agent session config options to hide from the agent
+    /// message editor (for example, "fast" for Claude Code Plus's Fast mode).
+    ///
+    /// Default: []
+    pub hidden_config_options: Option<Vec<String>>,
     /// Whether to show the merge conflict indicator in the status bar
     /// that offers to resolve conflicts using the agent.
     ///

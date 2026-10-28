@@ -3,6 +3,7 @@ use std::{cmp::Reverse, rc::Rc, sync::Arc};
 use acp_thread::AgentSessionConfigOptions;
 use agent_client_protocol::schema::v2 as acp;
 use agent_servers::AgentServer;
+use agent_settings::AgentSettings;
 
 use collections::HashSet;
 use fs::Fs;
@@ -13,7 +14,7 @@ use gpui::{
 use ordered_float::OrderedFloat;
 use picker::popover_menu::PickerPopoverMenu;
 use picker::{Picker, PickerDelegate};
-use settings::{AgentConfigOptionValue, SettingsStore};
+use settings::{AgentConfigOptionValue, Settings as _, SettingsStore};
 use ui::{
     ElevationIndex, IconButton, KeyBinding, ListItem, ListItemSpacing, PopoverMenuHandle, Switch,
     SwitchLabelPosition, ToggleState, Tooltip, prelude::*,
@@ -37,6 +38,7 @@ pub struct ConfigOptionsView {
     fs: Arc<dyn Fs>,
     config_option_ids: Vec<acp::SessionConfigId>,
     _refresh_task: Task<()>,
+    _settings_subscription: Subscription,
 }
 
 impl ConfigOptionsView {
@@ -70,6 +72,7 @@ impl ConfigOptionsView {
             fs,
             config_option_ids,
             _refresh_task: refresh_task,
+            _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
         }
     }
 
@@ -243,6 +246,20 @@ impl ConfigOptionsView {
         cx.notify();
     }
 
+    fn visible_selectors(&self, cx: &App) -> Vec<Entity<ConfigOptionSelector>> {
+        let hidden_config_options = &AgentSettings::get_global(cx).hidden_config_options;
+        self.selectors
+            .iter()
+            .filter(|selector| {
+                let config_id = selector.read(cx).config_id();
+                !hidden_config_options
+                    .iter()
+                    .any(|hidden| hidden.as_str() == config_id.0.as_ref())
+            })
+            .cloned()
+            .collect()
+    }
+
     fn build_selectors(
         config_options: &Rc<dyn AgentSessionConfigOptions>,
         agent_server: &Rc<dyn AgentServer>,
@@ -279,8 +296,9 @@ impl ConfigOptionsView {
 }
 
 impl Render for ConfigOptionsView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        if self.selectors.is_empty() {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selectors = self.visible_selectors(cx);
+        if selectors.is_empty() {
             return div().into_any_element();
         }
 
@@ -288,7 +306,7 @@ impl Render for ConfigOptionsView {
             .min_w_0()
             .flex_wrap()
             .gap_1()
-            .children(self.selectors.iter().cloned())
+            .children(selectors)
             .into_any_element()
     }
 }
@@ -1166,13 +1184,14 @@ mod tests {
             let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
             let agent_server: Rc<dyn AgentServer> = agent_server.clone();
             let fs = fs.clone();
-            let view = cx.new(|_| ConfigOptionsView {
+            let view = cx.new(|cx| ConfigOptionsView {
                 config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                 config_options,
                 selectors: Vec::new(),
                 agent_server,
                 fs,
                 _refresh_task: Task::ready(()),
+                _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
             });
 
             assert!(view.update(cx, |view, cx| {
@@ -1209,13 +1228,14 @@ mod tests {
             let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
             let agent_server: Rc<dyn AgentServer> = agent_server.clone();
             let fs = fs.clone();
-            let view = cx.new(|_| ConfigOptionsView {
+            let view = cx.new(|cx| ConfigOptionsView {
                 config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                 config_options,
                 selectors: Vec::new(),
                 agent_server,
                 fs,
                 _refresh_task: Task::ready(()),
+                _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
             });
 
             assert!(view.update(cx, |view, cx| {
@@ -1262,13 +1282,14 @@ mod tests {
             let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
             let agent_server: Rc<dyn AgentServer> = agent_server.clone();
             let fs = fs.clone();
-            let view = cx.new(|_| ConfigOptionsView {
+            let view = cx.new(|cx| ConfigOptionsView {
                 config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                 config_options,
                 selectors: Vec::new(),
                 agent_server,
                 fs,
                 _refresh_task: Task::ready(()),
+                _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
             });
 
             assert!(view.update(cx, |view, cx| {
@@ -1316,6 +1337,65 @@ mod tests {
         });
 
         assert!(!handled);
+    }
+
+    #[gpui::test]
+    fn hidden_config_options_are_not_rendered(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            AgentSettings::register(cx);
+        });
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "auto",
+                vec![
+                    acp::SessionConfigSelectOption::new("auto", "Auto"),
+                    acp::SessionConfigSelectOption::new("manual", "Manual"),
+                ],
+            ),
+            acp::SessionConfigOption::boolean("fast", "Fast mode", false),
+        ]));
+        let agent_server = Rc::new(TestAgentServer::default());
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let cx = cx.add_empty_window();
+        let view = cx.update(|window, cx| {
+            let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
+            let agent_server: Rc<dyn AgentServer> = agent_server.clone();
+            cx.new(|cx| ConfigOptionsView::new(config_options, agent_server, fs, window, cx))
+        });
+        let visible_ids = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                view.read(cx)
+                    .visible_selectors(cx)
+                    .iter()
+                    .map(|selector| selector.read(cx).config_id().clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            visible_ids(cx),
+            vec![
+                acp::SessionConfigId::new("mode"),
+                acp::SessionConfigId::new("fast")
+            ]
+        );
+
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.agent.get_or_insert_default().hidden_config_options =
+                        Some(vec!["fast".to_string()]);
+                });
+            });
+        });
+
+        assert_eq!(visible_ids(cx), vec![acp::SessionConfigId::new("mode")]);
     }
 
     #[gpui::test]
