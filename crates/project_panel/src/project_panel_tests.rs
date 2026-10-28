@@ -1572,6 +1572,102 @@ async fn test_adding_directory_via_file(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_copy_and_cut_paste_between_projects(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/source",
+        json!({
+            "one.txt": "one",
+            "folder": { "nested.txt": "nested" },
+            "two.txt": "two",
+        }),
+    )
+    .await;
+    fs.insert_tree("/target", json!({ "existing.txt": "" }))
+        .await;
+
+    let source_project = Project::test(fs.clone(), ["/source".as_ref()], cx).await;
+    let source_window =
+        cx.add_window(|window, cx| MultiWorkspace::test_new(source_project.clone(), window, cx));
+    let source_workspace = source_window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .unwrap();
+    let source_cx = &mut VisualTestContext::from_window(source_window.into(), cx);
+    let source_panel = source_workspace.update_in(source_cx, ProjectPanel::new);
+    source_cx.run_until_parked();
+
+    let target_project = Project::test(fs.clone(), ["/target".as_ref()], cx).await;
+    let target_window =
+        cx.add_window(|window, cx| MultiWorkspace::test_new(target_project.clone(), window, cx));
+    let target_workspace = target_window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .unwrap();
+    let target_cx = &mut VisualTestContext::from_window(target_window.into(), cx);
+    let target_panel = target_workspace.update_in(target_cx, ProjectPanel::new);
+    target_cx.run_until_parked();
+
+    select_path_with_mark(&source_panel, "source/one.txt", source_cx);
+    select_path_with_mark(&source_panel, "source/folder", source_cx);
+    source_panel.update_in(source_cx, |panel, window, cx| {
+        panel.copy(&Default::default(), window, cx);
+    });
+
+    select_path(&target_panel, "target", target_cx);
+    target_panel.update_in(target_cx, |panel, window, cx| {
+        assert!(panel.has_pasteable_content(cx));
+        panel.paste(&Default::default(), window, cx);
+    });
+    target_cx.run_until_parked();
+
+    assert_eq!(
+        fs.load(Path::new("/target/one.txt")).await.unwrap(),
+        "one",
+        "copied file should be pasted into the other project"
+    );
+    assert_eq!(
+        fs.load(Path::new("/target/folder/nested.txt"))
+            .await
+            .unwrap(),
+        "nested",
+        "copied folder should be pasted into the other project"
+    );
+    assert!(fs.is_file(Path::new("/source/one.txt")).await);
+    assert!(fs.is_dir(Path::new("/source/folder")).await);
+
+    source_panel.update_in(source_cx, |panel, _window, _cx| {
+        panel.marked_entries.clear();
+    });
+    select_path(&source_panel, "source/two.txt", source_cx);
+    source_panel.update_in(source_cx, |panel, window, cx| {
+        panel.cut(&Default::default(), window, cx);
+    });
+
+    select_path(&target_panel, "target", target_cx);
+    target_panel.update_in(target_cx, |panel, window, cx| {
+        panel.paste(&Default::default(), window, cx);
+    });
+    target_cx.run_until_parked();
+
+    assert_eq!(
+        fs.load(Path::new("/target/two.txt")).await.unwrap(),
+        "two",
+        "cut file should be pasted into the other project"
+    );
+    assert!(
+        !fs.is_file(Path::new("/source/two.txt")).await,
+        "cut file should be removed from the source project"
+    );
+    target_panel.update_in(target_cx, |panel, _window, cx| {
+        assert!(
+            !panel.has_pasteable_content(cx),
+            "a cut should only be pasted once across projects"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_copy_paste(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 

@@ -13,7 +13,7 @@ use editor::{
     },
 };
 use file_icons::FileIcons;
-use fs::TrashId;
+use fs::{RemoveOptions, TrashId};
 use git;
 use git::status::GitSummary;
 use git_ui_core::file_diff_view::FileDiffView;
@@ -21,8 +21,8 @@ use gpui::{
     Action, Anchor, AnyElement, App, AsyncWindowContext, Bounds,
     ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
     DragMoveEvent, Entity, EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths,
-    FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
-    ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
+    FileDropEvent, FocusHandle, Focusable, FontWeight, Global, Hsla, InteractiveElement,
+    KeyContext, ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, ParentElement, PathPromptOptions, Pixels, Point,
     PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
@@ -66,7 +66,7 @@ use ui::{
     ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
 };
 use util::{
-    ResultExt, TryFutureExt,
+    ResultExt,
     markdown::MarkdownInlineCode,
     maybe,
     paths::{PathExt, PathStyle, compare_paths},
@@ -256,6 +256,18 @@ impl EditState {
         self.leaf_entry_id.is_none()
     }
 }
+
+#[derive(Clone)]
+struct CrossProjectClipboard {
+    project: WeakEntity<Project>,
+    paths: Vec<PathBuf>,
+    is_cut: bool,
+}
+
+#[derive(Default)]
+struct GlobalProjectPanelClipboard(Option<CrossProjectClipboard>);
+
+impl Global for GlobalProjectPanelClipboard {}
 
 #[derive(Clone, Debug)]
 enum ClipboardEntry {
@@ -3583,6 +3595,7 @@ impl ProjectPanel {
         let entries = self.disjoint_effective_entries_excluding_roots(cx);
         if !entries.is_empty() {
             self.write_entries_to_system_clipboard(&entries, cx);
+            self.set_cross_project_clipboard(&entries, true, cx);
             self.clipboard = Some(ClipboardEntry::Cut(entries));
             cx.notify();
         }
@@ -3592,6 +3605,7 @@ impl ProjectPanel {
         let entries = self.disjoint_effective_entries_excluding_roots(cx);
         if !entries.is_empty() {
             self.write_entries_to_system_clipboard(&entries, cx);
+            self.set_cross_project_clipboard(&entries, false, cx);
             self.clipboard = Some(ClipboardEntry::Copied(entries));
             cx.notify();
         }
@@ -3670,6 +3684,11 @@ impl ProjectPanel {
             if let Some(entry_id) = target_entry_id {
                 self.drop_external_files(external_paths.paths(), entry_id, window, cx);
             }
+            return;
+        }
+
+        if let Some(clipboard) = self.cross_project_clipboard_from_other_project(cx) {
+            self.paste_from_other_project(clipboard, window, cx);
             return;
         }
 
@@ -3799,6 +3818,7 @@ impl ProjectPanel {
             if clip_is_cut {
                 // Convert the clipboard cut entry to a copy entry after the first paste.
                 self.clipboard = self.clipboard.take().map(ClipboardEntry::into_copy_entry);
+                cx.set_global(GlobalProjectPanelClipboard::default());
             }
 
             self.expand_entry(worktree_id, entry.id, cx);
@@ -4485,6 +4505,109 @@ impl ProjectPanel {
         }
     }
 
+    fn set_cross_project_clipboard(
+        &self,
+        entries: &BTreeSet<SelectedEntry>,
+        is_cut: bool,
+        cx: &mut App,
+    ) {
+        let project = self.project.read(cx);
+        let clipboard = project.is_local().then(|| CrossProjectClipboard {
+            project: self.project.downgrade(),
+            paths: entries
+                .iter()
+                .filter_map(|entry| {
+                    let worktree = project.worktree_for_id(entry.worktree_id, cx)?;
+                    let worktree = worktree.read(cx);
+                    let worktree_entry = worktree.entry_for_id(entry.entry_id)?;
+                    Some(worktree.absolutize(&worktree_entry.path))
+                })
+                .collect(),
+            is_cut,
+        });
+        cx.set_global(GlobalProjectPanelClipboard(clipboard));
+    }
+
+    fn cross_project_clipboard_from_other_project(
+        &self,
+        cx: &App,
+    ) -> Option<CrossProjectClipboard> {
+        let clipboard = cx.try_global::<GlobalProjectPanelClipboard>()?.0.as_ref()?;
+        if clipboard.project == self.project.downgrade() || clipboard.paths.is_empty() {
+            return None;
+        }
+        Some(clipboard.clone())
+    }
+
+    fn paste_from_other_project(
+        &mut self,
+        clipboard: CrossProjectClipboard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target_entry_id) = self
+            .selection
+            .map(|selection| selection.entry_id)
+            .or(self.state.last_worktree_root_id)
+        else {
+            return;
+        };
+        let Some(target_directory) = maybe!({
+            let project = self.project.read(cx);
+            let worktree = project.worktree_for_entry(target_entry_id, cx)?;
+            let worktree = worktree.read(cx);
+            let entry = worktree.entry_for_id(target_entry_id)?;
+            let directory = if entry.is_dir() {
+                entry.path.clone()
+            } else {
+                entry.path.parent()?.into()
+            };
+            Some(worktree.absolutize(&directory))
+        }) else {
+            return;
+        };
+
+        let paths: Vec<PathBuf> = clipboard
+            .paths
+            .into_iter()
+            .filter(|path| {
+                !target_directory.starts_with(path)
+                    && path.parent() != Some(target_directory.as_path())
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+
+        let copy_task = self.copy_external_files(&paths, target_entry_id, window, cx);
+        if !clipboard.is_cut {
+            copy_task.detach_and_log_err(cx);
+            return;
+        }
+
+        cx.set_global(GlobalProjectPanelClipboard::default());
+        let fs = self.project.read(cx).fs().clone();
+        cx.background_spawn(async move {
+            for path in copy_task.await? {
+                let is_dir = fs
+                    .metadata(&path)
+                    .await?
+                    .is_some_and(|metadata| metadata.is_dir && !metadata.is_symlink);
+                let options = RemoveOptions {
+                    recursive: true,
+                    ignore_if_not_exists: true,
+                };
+                if is_dir {
+                    fs.remove_dir(&path, options).await?;
+                } else {
+                    fs.remove_file(&path, options).await?;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn external_paths_from_system_clipboard(&self, cx: &App) -> Option<ExternalPaths> {
         let clipboard_item = cx.read_from_clipboard()?;
         for entry in clipboard_item.entries() {
@@ -4498,6 +4621,12 @@ impl ProjectPanel {
     }
 
     fn has_pasteable_content(&self, cx: &App) -> bool {
+        if self
+            .cross_project_clipboard_from_other_project(cx)
+            .is_some()
+        {
+            return true;
+        }
         if self
             .clipboard
             .as_ref()
@@ -5009,6 +5138,17 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.copy_external_files(paths, entry_id, window, cx)
+            .detach_and_log_err(cx);
+    }
+
+    fn copy_external_files(
+        &mut self,
+        paths: &[PathBuf],
+        entry_id: ProjectEntryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<Arc<Path>>>> {
         let mut paths: Vec<Arc<Path>> = paths.iter().map(|path| Arc::from(path.clone())).collect();
 
         let open_file_after_drop = paths.len() == 1 && paths[0].is_file();
@@ -5026,7 +5166,7 @@ impl ProjectPanel {
             };
             Some((target_directory, worktree, fs))
         }) else {
-            return;
+            return Task::ready(Ok(Vec::new()));
         };
 
         let mut paths_to_replace = Vec::new();
@@ -5042,89 +5182,85 @@ impl ProjectPanel {
         }
 
         cx.spawn_in(window, async move |this, cx| {
-            async move {
-                for (filename, original_path) in &paths_to_replace {
-                    let prompt_message = format!(
-                        concat!(
-                            "A file or folder with name {} ",
-                            "already exists in the destination folder. ",
-                            "Do you want to replace it?"
-                        ),
-                        MarkdownInlineCode(filename)
-                    );
-                    let answer = cx
-                        .update(|window, cx| {
-                            window.prompt(
-                                PromptLevel::Info,
-                                &prompt_message,
-                                None,
-                                &["Replace", "Cancel"],
-                                cx,
-                            )
-                        })?
-                        .await?;
+            for (filename, original_path) in &paths_to_replace {
+                let prompt_message = format!(
+                    concat!(
+                        "A file or folder with name {} ",
+                        "already exists in the destination folder. ",
+                        "Do you want to replace it?"
+                    ),
+                    MarkdownInlineCode(filename)
+                );
+                let answer = cx
+                    .update(|window, cx| {
+                        window.prompt(
+                            PromptLevel::Info,
+                            &prompt_message,
+                            None,
+                            &["Replace", "Cancel"],
+                            cx,
+                        )
+                    })?
+                    .await?;
 
-                    if answer == 1
-                        && let Some(item_idx) = paths.iter().position(|p| p == original_path)
-                    {
-                        paths.remove(item_idx);
+                if answer == 1
+                    && let Some(item_idx) = paths.iter().position(|p| p == original_path)
+                {
+                    paths.remove(item_idx);
+                }
+            }
+
+            if paths.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let (worktree_id, task) = worktree.update(cx, |worktree, cx| {
+                (
+                    worktree.id(),
+                    worktree.copy_external_entries(target_directory, paths.clone(), fs, cx),
+                )
+            });
+
+            let opened_entries: Vec<_> = task
+                .await
+                .with_context(|| "failed to copy external paths")?;
+            this.update_in(cx, |this, window, cx| {
+                let mut did_open = false;
+                if open_file_after_drop && !opened_entries.is_empty() {
+                    let settings = ProjectPanelSettings::get_global(cx);
+                    if settings.auto_open.should_open_on_drop() {
+                        this.open_entry(opened_entries[0], true, false, cx);
+                        did_open = true;
                     }
                 }
 
-                if paths.is_empty() {
-                    return Ok(());
+                if !did_open {
+                    let new_selection = opened_entries
+                        .last()
+                        .map(|&entry_id| (worktree_id, entry_id));
+                    for &entry_id in &opened_entries {
+                        this.expand_entry(worktree_id, entry_id, cx);
+                    }
+                    this.marked_entries.clear();
+                    this.update_visible_entries(new_selection, false, false, window, cx);
                 }
 
-                let (worktree_id, task) = worktree.update(cx, |worktree, cx| {
-                    (
-                        worktree.id(),
-                        worktree.copy_external_entries(target_directory, paths, fs, cx),
-                    )
-                });
-
-                let opened_entries: Vec<_> = task
-                    .await
-                    .with_context(|| "failed to copy external paths")?;
-                this.update_in(cx, |this, window, cx| {
-                    let mut did_open = false;
-                    if open_file_after_drop && !opened_entries.is_empty() {
-                        let settings = ProjectPanelSettings::get_global(cx);
-                        if settings.auto_open.should_open_on_drop() {
-                            this.open_entry(opened_entries[0], true, false, cx);
-                            did_open = true;
-                        }
-                    }
-
-                    if !did_open {
-                        let new_selection = opened_entries
-                            .last()
-                            .map(|&entry_id| (worktree_id, entry_id));
-                        for &entry_id in &opened_entries {
-                            this.expand_entry(worktree_id, entry_id, cx);
-                        }
-                        this.marked_entries.clear();
-                        this.update_visible_entries(new_selection, false, false, window, cx);
-                    }
-
-                    let changes: Vec<Change> = opened_entries
-                        .iter()
-                        .filter_map(|entry_id| {
-                            worktree.read(cx).entry_for_id(*entry_id).map(|entry| {
-                                Change::Created(ProjectPath {
-                                    worktree_id,
-                                    path: entry.path.clone(),
-                                })
+                let changes: Vec<Change> = opened_entries
+                    .iter()
+                    .filter_map(|entry_id| {
+                        worktree.read(cx).entry_for_id(*entry_id).map(|entry| {
+                            Change::Created(ProjectPath {
+                                worktree_id,
+                                path: entry.path.clone(),
                             })
                         })
-                        .collect();
+                    })
+                    .collect();
 
-                    this.undo_manager.record(changes).log_err();
-                })
-            }
-            .log_err()
-            .await
+                this.undo_manager.record(changes).log_err();
+            })?;
+            Ok(paths)
         })
-        .detach();
     }
 
     fn refresh_drag_cursor_style(
