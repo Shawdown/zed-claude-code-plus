@@ -8133,6 +8133,8 @@ impl ThreadView {
                     .items_center()
                     .cursor_pointer()
                     .occlude()
+                    .opacity(0.5)
+                    .group_hover("user-message-markers", |style| style.opacity(1.))
                     .child(
                         div()
                             .w_full()
@@ -8159,12 +8161,21 @@ impl ThreadView {
 
         Some(
             div()
+                .group("user-message-markers")
                 .absolute()
-                .top(MARKER_TRACK_PADDING)
-                .bottom(MARKER_TRACK_PADDING)
-                .right(px(3.))
-                .w(px(8.))
-                .children(markers)
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(px(14.))
+                .child(
+                    div()
+                        .absolute()
+                        .top(MARKER_TRACK_PADDING)
+                        .bottom(MARKER_TRACK_PADDING)
+                        .right(px(3.))
+                        .w(px(8.))
+                        .children(markers),
+                )
                 .into_any_element(),
         )
     }
