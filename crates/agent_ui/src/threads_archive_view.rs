@@ -287,7 +287,7 @@ impl ThreadsArchiveView {
                 ThreadFilter::All => true,
                 ThreadFilter::ArchivedOnly => t.archived,
             })
-            .sorted_by_cached_key(|t| t.created_at.unwrap_or(t.updated_at))
+            .sorted_by_cached_key(|t| t.interacted_at.unwrap_or(t.updated_at))
             .rev()
             .cloned()
             .collect::<Vec<_>>();
@@ -328,7 +328,7 @@ impl ThreadsArchiveView {
 
             let entry_bucket = {
                 let entry_date = session
-                    .created_at
+                    .interacted_at
                     .unwrap_or(session.updated_at)
                     .with_timezone(&Local)
                     .naive_local()
@@ -627,8 +627,9 @@ impl ThreadsArchiveView {
 
                 let focus_handle = self.focus_handle.clone();
 
-                let timestamp =
-                    format_history_entry_timestamp(thread.created_at.unwrap_or(thread.updated_at));
+                let timestamp = format_history_entry_timestamp(
+                    thread.interacted_at.unwrap_or(thread.updated_at),
+                );
 
                 let icon_from_external_svg = self
                     .agent_server_store
