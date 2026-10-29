@@ -112,7 +112,8 @@ jobs:
         CLEAN: ${{ steps.merge.outputs.clean }}
       run: |
         title="Upstream Zed $TAG is available"
-        if [ -n "$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[].number')" ]; then
+        issues_enabled=$(gh repo view "$GITHUB_REPOSITORY" --json hasIssuesEnabled --jq .hasIssuesEnabled)
+        if [ "$issues_enabled" = "true" ] && [ -n "$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[].number')" ]; then
           echo "Issue already open"
           exit 0
         fi
@@ -140,4 +141,10 @@ jobs:
           echo
           echo "Pushing the version bump builds and publishes the Windows release."
         } > body.md
-        gh issue create --title "$title" --body-file body.md
+        if [ "$issues_enabled" = "true" ]; then
+          gh issue create --title "$title" --body-file body.md
+        else
+          { echo "## $title"; echo; cat body.md; } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=$title::Issues are disabled on this repository, so the merge instructions are in the run summary."
+          exit 1
+        fi

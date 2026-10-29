@@ -10,7 +10,7 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
+    Overflow, Pixels, Point, ScrollDelta, ScrollEvent, Size, Style, StyleRefinement, Styled,
     Window, point, px, size,
 };
 use collections::VecDeque;
@@ -1610,7 +1610,7 @@ impl Element for List {
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
         let mut accumulated_scroll_delta = ScrollDelta::default();
-        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+        window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
@@ -1731,7 +1731,7 @@ impl sum_tree::SeekTarget<'_, ListItemSummary, ListItemSummary> for Height {
 #[cfg(test)]
 mod test {
 
-    use gpui::{ScrollDelta, ScrollWheelEvent};
+    use gpui::{ScrollDelta, ScrollEvent};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -1826,7 +1826,7 @@ mod test {
         state.reset(5);
 
         // And then receive a scroll event _before_ the next paint
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(1.), px(1.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-500.))),
             ..Default::default()
@@ -1901,7 +1901,7 @@ mod test {
                     div()
                         .h(px(20.))
                         .w_full()
-                        .on_scroll_wheel(move |_, _, cx| {
+                        .on_scroll(move |_, _, cx| {
                             child_saw_event.set(true);
                             cx.stop_propagation();
                         })
@@ -1920,7 +1920,7 @@ mod test {
             .into_any_element()
         });
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(50.), px(10.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
             ..Default::default()
@@ -2263,7 +2263,7 @@ mod test {
 
         state.remeasure_items(5..6);
 
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
             ..Default::default()
@@ -2331,7 +2331,7 @@ mod test {
 
         // ...and then the user scrolls down by 30px before the next frame,
         // landing at offset 70.
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
             ..Default::default()
@@ -2555,7 +2555,7 @@ mod test {
 
         // Simulate the user scrolling up.
         // This should disengage follow-tail.
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(100.))),
             ..Default::default()
@@ -2806,7 +2806,7 @@ mod test {
         assert!(state.is_following_tail());
 
         // Scroll up — follow_tail should suspend (not fully disengage).
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(50.))),
             ..Default::default()
@@ -2814,7 +2814,7 @@ mod test {
         assert!(!state.is_following_tail());
 
         // Scroll back down to the bottom.
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-10000.))),
             ..Default::default()
@@ -2865,7 +2865,7 @@ mod test {
         // Scroll up a meaningful amount — suspends follow_tail.
         // 20 items × 50px = 1000px. viewport 200px. scroll_max = 800px.
         // Scrolling up 200px puts us at 600px, clearly not at bottom.
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(200.))),
             ..Default::default()

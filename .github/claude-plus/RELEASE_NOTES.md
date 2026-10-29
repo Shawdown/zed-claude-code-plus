@@ -1,7 +1,6 @@
 ### What's new in this release
-- A number in the composer, left of the prompt cache status, counts the agent's running background tasks (accent coloured while any run, muted once they have all finished). Clicking it lists the running tasks and those that finished since your last message, one row each with its status and run time; hovering a row shows the full command, and clicking it expands the command with a copy button, how it ended and its latest output. Each row can stop the task, jump to the tool call that started it, or jump to Claude's reply about it.
-- Tool calls that started a background task show "In background · 6m 41s" under the card while it runs, and "Done", "Stopped", "Failed" or "Ended" afterwards. A reply Claude starts on its own after a task finishes names that task in a chip that opens its details.
-- Pairs with claude-agent-acp-plus 0.94.0-plus.20, which reports background tasks.
+- Based on Zed v1.26.2.
+- The upstream sync workflow puts merge instructions in the run summary when issues are disabled on the repository, instead of failing on the issue step.
 
 ### Features
 - Edit previous messages for agents that advertise `claudeCodePlus` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
