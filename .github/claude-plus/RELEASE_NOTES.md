@@ -1,6 +1,5 @@
 ### What's new in this release
-- Based on Zed v1.26.2.
-- The upstream sync workflow puts merge instructions in the run summary when issues are disabled on the repository, instead of failing on the issue step.
+- Scrollbar marker tooltips drop the "Claude" and "Thinking" prefixes. Claude's replies are shown in Claude orange, on both the tooltip and the marker, and thinking previews are muted italic.
 
 ### Features
 - Edit previous messages for agents that advertise `claudeCodePlus` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
@@ -10,7 +9,7 @@
 - **Run in background** link under running Bash, PowerShell and Agent tool calls that the agent marks as foreground.
 - Background task counter in the composer with a list to inspect, stop and find tasks (claude-agent-acp-plus 0.94.0-plus.20+).
 - Per-thread **Expand Thinking Blocks** toggle in the agent panel menu, overriding `thinking_display` for that thread.
-- Markers on the thread scrollbar for your prompts, Claude's messages and its thinking, with a preview on hover.
+- Markers on the thread scrollbar for your prompts, Claude's messages and its thinking, with a preview on hover. Claude's markers and previews are shown in Claude orange.
 - `agent.wrap_terminal_commands` setting and a hover button on command blocks to toggle wrapping.
 - `agent.show_add_context_button`, `agent.show_follow_button` and `agent.hidden_config_options` settings to hide message editor controls.
 - Thread history shows the last interaction time.

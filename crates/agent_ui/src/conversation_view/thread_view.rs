@@ -8462,6 +8462,7 @@ impl ThreadView {
         let marker_color = colors.text_muted.opacity(0.7);
         let latest_marker_color = colors.text_accent;
         let hover_color = colors.text_accent;
+        let claude_color: Hsla = gpui::rgb(0xD97757).into();
 
         let marker_position = |entry_ix: usize, fraction_of_entry: f32| {
             let item_offset = self.list_state.item_offset_for_scrollbar(entry_ix)?;
@@ -8485,12 +8486,11 @@ impl ThreadView {
                         marker_position(marker.entry_ix, marker.fraction_of_entry)?;
                     let offset_in_item = item_height * marker.fraction_of_entry;
                     let entry_ix = marker.entry_ix;
-                    let (label, marker_size, opacity) = match marker.kind {
-                        AssistantMarkerKind::Message => ("Claude", gpui::size(px(4.), px(2.)), 0.5),
-                        AssistantMarkerKind::Thinking => {
-                            ("Thinking", gpui::size(px(2.), px(2.)), 0.35)
-                        }
+                    let (marker_size, opacity) = match marker.kind {
+                        AssistantMarkerKind::Message => (gpui::size(px(4.), px(2.)), 0.75),
+                        AssistantMarkerKind::Thinking => (gpui::size(px(2.), px(2.)), 0.4),
                     };
+                    let kind = marker.kind;
                     let preview = marker.preview;
                     Some(
                         div()
@@ -8515,12 +8515,20 @@ impl ThreadView {
                                     .when(marker.kind == AssistantMarkerKind::Message, |this| {
                                         this.rounded_xs()
                                     })
-                                    .bg(marker_color)
-                                    .group_hover("message-marker", |style| style.bg(hover_color)),
+                                    .bg(claude_color),
                             )
-                            .tooltip(move |_window, cx| {
-                                Tooltip::simple(format!("{label}  {preview}"), cx)
-                            })
+                            .tooltip(Tooltip::element(move |_window, _cx| {
+                                let label = Label::new(preview.clone());
+                                match kind {
+                                    AssistantMarkerKind::Message => {
+                                        label.color(Color::Custom(claude_color))
+                                    }
+                                    AssistantMarkerKind::Thinking => {
+                                        label.color(Color::Muted).italic()
+                                    }
+                                }
+                                .into_any_element()
+                            }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.list_state.scroll_to(ListOffset {
                                     item_ix: entry_ix,
