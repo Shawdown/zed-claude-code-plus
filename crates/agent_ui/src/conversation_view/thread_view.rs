@@ -8078,7 +8078,7 @@ impl ThreadView {
         }
     }
 
-    fn render_user_message_markers(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    fn render_message_markers(&self, cx: &Context<Self>) -> Option<AnyElement> {
         const MARKER_TRACK_PADDING: Pixels = px(4.);
         const MINIMUM_THUMB_SIZE: Pixels = px(25.);
 
@@ -8095,26 +8095,101 @@ impl ThreadView {
         }
         let thumb_travel = (viewport_height - thumb_height) / viewport_height;
 
-        let user_message_indices = self
-            .thread
-            .read(cx)
-            .entries()
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| matches!(entry, AgentThreadEntry::UserMessage(_)))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let last_user_message_index = *user_message_indices.last()?;
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let mut user_message_indices = Vec::new();
+        let mut assistant_markers = Vec::new();
+        for (entry_ix, entry) in entries.iter().enumerate() {
+            match entry {
+                AgentThreadEntry::UserMessage(_) => user_message_indices.push(entry_ix),
+                AgentThreadEntry::AssistantMessage(message) => {
+                    assistant_markers.extend(assistant_message_markers(entry_ix, message, cx));
+                }
+                _ => {}
+            }
+        }
+        let last_user_message_index = user_message_indices.last().copied();
+        if last_user_message_index.is_none() && assistant_markers.is_empty() {
+            return None;
+        }
 
         let colors = cx.theme().colors();
         let marker_color = colors.text_muted.opacity(0.7);
         let latest_marker_color = colors.text_accent;
         let hover_color = colors.text_accent;
 
-        let markers = user_message_indices.into_iter().filter_map(|entry_ix| {
+        let marker_position = |entry_ix: usize, fraction_of_entry: f32| {
             let item_offset = self.list_state.item_offset_for_scrollbar(entry_ix)?;
-            let position = (item_offset / max_offset).clamp(0., 1.) * thumb_travel;
-            let color = if entry_ix == last_user_message_index {
+            let item_height = self
+                .list_state
+                .item_offset_for_scrollbar(entry_ix + 1)
+                .map_or(Pixels::ZERO, |next_offset| next_offset - item_offset);
+            let offset = item_offset + item_height * fraction_of_entry;
+            Some((
+                (offset / max_offset).clamp(0., 1.) * thumb_travel,
+                item_height,
+            ))
+        };
+
+        let assistant_marker_elements =
+            assistant_markers
+                .into_iter()
+                .enumerate()
+                .filter_map(|(marker_ix, marker)| {
+                    let (position, item_height) =
+                        marker_position(marker.entry_ix, marker.fraction_of_entry)?;
+                    let offset_in_item = item_height * marker.fraction_of_entry;
+                    let entry_ix = marker.entry_ix;
+                    let (label, marker_size, opacity) = match marker.kind {
+                        AssistantMarkerKind::Message => ("Claude", gpui::size(px(4.), px(2.)), 0.5),
+                        AssistantMarkerKind::Thinking => {
+                            ("Thinking", gpui::size(px(2.), px(2.)), 0.35)
+                        }
+                    };
+                    let preview = marker.preview;
+                    Some(
+                        div()
+                            .id(("assistant-message-marker", marker_ix))
+                            .group("message-marker")
+                            .absolute()
+                            .top(relative(position))
+                            .left_0()
+                            .right_0()
+                            .h(px(7.))
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .cursor_pointer()
+                            .occlude()
+                            .opacity(opacity)
+                            .hover(|style| style.opacity(1.))
+                            .child(
+                                div()
+                                    .w(marker_size.width)
+                                    .h(marker_size.height)
+                                    .when(marker.kind == AssistantMarkerKind::Message, |this| {
+                                        this.rounded_xs()
+                                    })
+                                    .bg(marker_color)
+                                    .group_hover("message-marker", |style| style.bg(hover_color)),
+                            )
+                            .tooltip(move |_window, cx| {
+                                Tooltip::simple(format!("{label}  {preview}"), cx)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.list_state.scroll_to(ListOffset {
+                                    item_ix: entry_ix,
+                                    offset_in_item,
+                                });
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    )
+                });
+
+        let user_marker_elements = user_message_indices.into_iter().filter_map(|entry_ix| {
+            let (position, _) = marker_position(entry_ix, 0.)?;
+            let color = if Some(entry_ix) == last_user_message_index {
                 latest_marker_color
             } else {
                 marker_color
@@ -8123,7 +8198,7 @@ impl ThreadView {
             Some(
                 div()
                     .id(("user-message-marker", entry_ix))
-                    .group("user-message-marker")
+                    .group("message-marker")
                     .absolute()
                     .top(relative(position))
                     .left_0()
@@ -8141,7 +8216,7 @@ impl ThreadView {
                             .h(px(3.))
                             .rounded_xs()
                             .bg(color)
-                            .group_hover("user-message-marker", |style| style.bg(hover_color)),
+                            .group_hover("message-marker", |style| style.bg(hover_color)),
                     )
                     .tooltip(move |_window, cx| {
                         let preview = thread
@@ -8155,7 +8230,8 @@ impl ThreadView {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.scroll_to_user_message_index(Some(entry_ix), cx);
-                    })),
+                    }))
+                    .into_any_element(),
             )
         });
 
@@ -8173,7 +8249,8 @@ impl ThreadView {
                         .bottom(MARKER_TRACK_PADDING)
                         .right(px(3.))
                         .w(px(8.))
-                        .children(markers),
+                        .children(assistant_marker_elements)
+                        .children(user_marker_elements),
                 )
                 .into_any_element(),
         )
@@ -13727,7 +13804,7 @@ impl Render for ThreadView {
                         .size_full()
                         .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
-                        .children(self.render_user_message_markers(cx))
+                        .children(self.render_message_markers(cx))
                         .into_any()
                 } else {
                     this.into_any()
@@ -15599,13 +15676,59 @@ pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
     .detach();
 }
 
-fn user_message_preview(entry: &AgentThreadEntry, cx: &App) -> Option<SharedString> {
-    const MAX_PREVIEW_CHARS: usize = 120;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssistantMarkerKind {
+    Message,
+    Thinking,
+}
 
+struct AssistantMarker {
+    entry_ix: usize,
+    fraction_of_entry: f32,
+    kind: AssistantMarkerKind,
+    preview: SharedString,
+}
+
+fn assistant_message_markers(
+    entry_ix: usize,
+    message: &AssistantMessage,
+    cx: &App,
+) -> Vec<AssistantMarker> {
+    let chunk_count = message.chunks.len();
+    let mut markers: Vec<AssistantMarker> = Vec::new();
+    let mut previous_kind = None;
+    for (chunk_ix, chunk) in message.chunks.iter().enumerate() {
+        let (kind, block) = match chunk {
+            AssistantMessageChunk::Message { block, .. } => (AssistantMarkerKind::Message, block),
+            AssistantMessageChunk::Thought { block, .. } => (AssistantMarkerKind::Thinking, block),
+        };
+        if previous_kind == Some(kind) {
+            continue;
+        }
+        let Some(preview) = first_line_preview(&block.to_markdown(cx)) else {
+            continue;
+        };
+        previous_kind = Some(kind);
+        markers.push(AssistantMarker {
+            entry_ix,
+            fraction_of_entry: chunk_ix as f32 / chunk_count as f32,
+            kind,
+            preview,
+        });
+    }
+    markers
+}
+
+fn user_message_preview(entry: &AgentThreadEntry, cx: &App) -> Option<SharedString> {
     let AgentThreadEntry::UserMessage(message) = entry else {
         return None;
     };
-    let markdown = message.content.to_markdown(cx);
+    first_line_preview(&message.content.to_markdown(cx))
+}
+
+fn first_line_preview(markdown: &str) -> Option<SharedString> {
+    const MAX_PREVIEW_CHARS: usize = 120;
+
     let first_line = markdown
         .lines()
         .map(str::trim)
