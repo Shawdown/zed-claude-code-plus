@@ -263,6 +263,14 @@ pub trait AgentConnection {
         None
     }
 
+    fn background_tasks(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentSessionBackgroundTasks>> {
+        None
+    }
+
     fn set_title(
         &self,
         _session_id: &acp_v2::SessionId,
@@ -334,6 +342,17 @@ pub trait AgentSessionRunInBackground {
         tool_call_ids: Vec<acp_v2::ToolCallId>,
         cx: &mut App,
     ) -> Task<Result<RunInBackgroundOutcome>>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct BackgroundTaskOutput {
+    pub output: String,
+    pub truncated: bool,
+}
+
+pub trait AgentSessionBackgroundTasks {
+    fn stop(&self, task_id: String, cx: &mut App) -> Task<Result<bool>>;
+    fn output(&self, task_id: String, cx: &mut App) -> Task<Result<BackgroundTaskOutput>>;
 }
 
 pub trait AgentSessionClientUserMessageIds {

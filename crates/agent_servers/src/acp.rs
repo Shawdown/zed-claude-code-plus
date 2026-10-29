@@ -2170,6 +2170,27 @@ impl AgentConnection for AcpConnection {
         }))
     }
 
+    fn background_tasks(
+        &self,
+        session_id: &acp_v2::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionBackgroundTasks>> {
+        let capability = self.claude_code_plus_capability("backgroundTasks")?;
+        let method = |key: &str, default: &str| {
+            capability
+                .get(key)
+                .and_then(|method| method.as_str())
+                .unwrap_or(default)
+                .to_string()
+        };
+        Some(Rc::new(AcpSessionBackgroundTasks {
+            connection: self.connection.clone(),
+            session_id: session_id.clone(),
+            stop_method: method("stopMethod", DEFAULT_STOP_BACKGROUND_TASK_METHOD),
+            output_method: method("outputMethod", DEFAULT_BACKGROUND_TASK_OUTPUT_METHOD),
+        }))
+    }
+
     fn starts_new_thread_for_command(&self, command_name: &str) -> bool {
         self.claude_code_plus_capability("newThreadCommands")
             .and_then(|capability| capability.get("commands"))
@@ -2244,6 +2265,8 @@ impl AgentConnection for AcpConnection {
 const CLAUDE_CODE_PLUS_META_KEY: &str = "claudeCodePlus";
 const DEFAULT_TRUNCATE_METHOD: &str = "_claudeCodePlus/truncate";
 const DEFAULT_RUN_IN_BACKGROUND_METHOD: &str = "_claudeCodePlus/runInBackground";
+const DEFAULT_STOP_BACKGROUND_TASK_METHOD: &str = "_claudeCodePlus/stopBackgroundTask";
+const DEFAULT_BACKGROUND_TASK_OUTPUT_METHOD: &str = "_claudeCodePlus/backgroundTaskOutput";
 
 fn send_prompt(
     conn: ConnectionTo<Agent>,
@@ -2403,6 +2426,61 @@ impl acp_thread::AgentSessionRunInBackground for AcpSessionRunInBackground {
             let response: RunInBackgroundResponse = serde_json::from_value(response)?;
             Ok(response.outcome)
         })
+    }
+}
+
+struct AcpSessionBackgroundTasks {
+    connection: ConnectionTo<Agent>,
+    session_id: acp_v2::SessionId,
+    stop_method: String,
+    output_method: String,
+}
+
+#[derive(Deserialize)]
+struct StopBackgroundTaskResponse {
+    stopped: bool,
+}
+
+impl AcpSessionBackgroundTasks {
+    fn request<T: serde::de::DeserializeOwned + 'static>(
+        &self,
+        method: &str,
+        task_id: String,
+        cx: &mut App,
+    ) -> Task<Result<T>> {
+        let request = UntypedMessage::new(
+            method,
+            serde_json::json!({
+                "sessionId": self.session_id.0.as_ref(),
+                "taskId": task_id,
+            }),
+        );
+        let conn = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let request = request.map_err(map_acp_error)?;
+            let response = conn
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            Ok(serde_json::from_value(response)?)
+        })
+    }
+}
+
+impl acp_thread::AgentSessionBackgroundTasks for AcpSessionBackgroundTasks {
+    fn stop(&self, task_id: String, cx: &mut App) -> Task<Result<bool>> {
+        let response = self.request::<StopBackgroundTaskResponse>(&self.stop_method, task_id, cx);
+        cx.foreground_executor()
+            .spawn(async move { Ok(response.await?.stopped) })
+    }
+
+    fn output(
+        &self,
+        task_id: String,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::BackgroundTaskOutput>> {
+        self.request(&self.output_method, task_id, cx)
     }
 }
 
@@ -2699,6 +2777,14 @@ pub mod test_support {
             cx: &App,
         ) -> Option<Rc<dyn acp_thread::AgentSessionRunInBackground>> {
             self.inner.run_in_background(session_id, cx)
+        }
+
+        fn background_tasks(
+            &self,
+            session_id: &acp_v2::SessionId,
+            cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionBackgroundTasks>> {
+            self.inner.background_tasks(session_id, cx)
         }
 
         fn set_title(

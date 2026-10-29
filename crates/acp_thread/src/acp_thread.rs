@@ -285,6 +285,74 @@ pub fn runs_in_foreground_from_meta(meta: &Option<acp_v2::Meta>) -> Option<bool>
         .and_then(|value| value.as_bool())
 }
 
+pub const BACKGROUND_TASK_META_KEY: &str = "claudeCodePlus/backgroundTask";
+pub const BACKGROUND_TASK_REPLY_META_KEY: &str = "claudeCodePlus/backgroundTaskReply";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+    Ended,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskState {
+    pub task_id: String,
+    pub tool_call_id: String,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    pub status: BackgroundTaskStatus,
+    pub started_at: i64,
+    #[serde(default)]
+    pub ended_at: Option<i64>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub stopped_by_client: bool,
+}
+
+impl BackgroundTaskState {
+    pub fn is_running(&self) -> bool {
+        self.status == BackgroundTaskStatus::Running
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskReference {
+    pub task_id: String,
+    pub tool_call_id: String,
+}
+
+#[derive(Deserialize)]
+struct BackgroundTaskReply {
+    tasks: Vec<BackgroundTaskReference>,
+}
+
+pub fn background_task_from_meta(meta: &Option<acp_v2::Meta>) -> Option<BackgroundTaskState> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(BACKGROUND_TASK_META_KEY))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+pub fn background_task_reply_from_meta(
+    meta: &Option<acp_v2::Meta>,
+) -> Vec<BackgroundTaskReference> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(BACKGROUND_TASK_REPLY_META_KEY))
+        .and_then(|value| serde_json::from_value::<BackgroundTaskReply>(value.clone()).ok())
+        .map(|reply| reply.tasks)
+        .unwrap_or_default()
+}
+
 pub fn sandbox_not_applied_from_meta(
     meta: &Option<acp_v2::Meta>,
 ) -> Option<SandboxNotAppliedReason> {
@@ -367,6 +435,7 @@ pub struct AssistantMessage {
     pub chunks: Vec<AssistantMessageChunk>,
     pub indented: bool,
     pub is_subagent_output: bool,
+    pub background_task_reply: Vec<BackgroundTaskReference>,
 }
 
 impl AssistantMessage {
@@ -1085,6 +1154,7 @@ pub struct ToolCall {
     /// the command was sandboxed normally (or sandboxing was off).
     pub sandbox_not_applied: Option<SandboxNotAppliedReason>,
     pub runs_in_foreground: bool,
+    pub background_task: Option<BackgroundTaskState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1330,6 +1400,7 @@ impl ToolCall {
             sandbox_fallback_authorization_details_from_meta(&meta);
         let sandbox_not_applied = sandbox_not_applied_from_meta(&meta);
         let runs_in_foreground = runs_in_foreground_from_meta(&meta).unwrap_or(false);
+        let background_task = background_task_from_meta(&meta);
         let label = Self::new_label(
             title.as_ref().filter(|title| !title.trim().is_empty()),
             tool_name.as_ref(),
@@ -1361,6 +1432,7 @@ impl ToolCall {
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
             runs_in_foreground,
+            background_task,
         };
         result.update_raw_output_content(&language_registry, cx);
         Ok(result)
@@ -1517,6 +1589,9 @@ impl ToolCall {
                 if let Some(value) = runs_in_foreground_from_meta(&meta) {
                     self.runs_in_foreground = value;
                 }
+                if let Some(value) = background_task_from_meta(&meta) {
+                    self.background_task = Some(value);
+                }
                 if meta.is_some() {
                     self.meta = meta;
                 }
@@ -1533,6 +1608,9 @@ impl ToolCall {
                     self.sandbox_not_applied = sandbox_not_applied_from_meta(&self.meta);
                     self.runs_in_foreground =
                         runs_in_foreground_from_meta(&self.meta).unwrap_or(false);
+                    if let Some(value) = background_task_from_meta(&self.meta) {
+                        self.background_task = Some(value);
+                    }
                 }
                 if name_changed || meta_changed {
                     self.tool_name = self
@@ -3498,6 +3576,7 @@ pub struct AcpThread {
     // Notices stay with the live session, but never enter conversation history or exports.
     notices: Vec<(usize, acp_v2::Notice)>,
     next_notice_id: usize,
+    background_tasks_acknowledged_at: i64,
     elicitations: ElicitationStore,
     permission_requests: IndexMap<PermissionRequestId, PermissionRequest>,
     plans: HashMap<PlanIdentity, Plan>,
@@ -3841,6 +3920,7 @@ impl AcpThread {
             entries: Default::default(),
             notices: Vec::new(),
             next_notice_id: 0,
+            background_tasks_acknowledged_at: 0,
             elicitations: ElicitationStore::default(),
             permission_requests: IndexMap::default(),
             plans: HashMap::default(),
@@ -4475,15 +4555,18 @@ impl AcpThread {
             acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk {
                 content,
                 message_id,
+                meta,
                 ..
             }) => {
-                self.push_assistant_content_block_with_message_id(
-                    message_id,
-                    content::from_v1(content).map_err(acp_v1::Error::from)?,
-                    false,
-                    false,
-                    cx,
-                );
+                let content = content::from_v1(content).map_err(acp_v1::Error::from)?;
+                let background_task_reply = background_task_reply_from_meta(&meta);
+                if background_task_reply.is_empty() {
+                    self.push_assistant_content_block_with_message_id(
+                        message_id, content, false, false, cx,
+                    );
+                } else {
+                    self.push_background_task_reply(message_id, content, background_task_reply, cx);
+                }
             }
             acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk {
                 content,
@@ -4795,6 +4878,7 @@ impl AcpThread {
                             chunks: vec![chunk],
                             indented: false,
                             is_subagent_output: false,
+                            background_task_reply: Vec::new(),
                         }));
                     Ok(MessageLocation::Assistant {
                         entry_index,
@@ -4978,6 +5062,7 @@ impl AcpThread {
                 chunks,
                 indented: existing_indented,
                 is_subagent_output: _,
+                background_task_reply: _,
             }) = last_entry
             && *existing_indented == indented
         {
@@ -5043,10 +5128,61 @@ impl AcpThread {
                     chunks: vec![chunk],
                     indented,
                     is_subagent_output: false,
+                    background_task_reply: Vec::new(),
                 }),
                 cx,
             );
         }
+    }
+
+    fn push_background_task_reply(
+        &mut self,
+        message_id: Option<acp_v1::MessageId>,
+        chunk: acp_v2::ContentBlock,
+        background_task_reply: Vec<BackgroundTaskReference>,
+        cx: &mut Context<Self>,
+    ) {
+        let path_style = self.project.read(cx).path_style(cx);
+        let language_registry = self.project.read(cx).languages().clone();
+        self.flush_streaming_text(cx);
+        let block = MessageContent::new(chunk, &language_registry, path_style, cx);
+        self.push_entry(
+            AgentThreadEntry::AssistantMessage(AssistantMessage {
+                chunks: vec![AssistantMessageChunk::Message {
+                    identity: MessageIdentity::Legacy(message_id),
+                    meta: None,
+                    block,
+                }],
+                indented: false,
+                is_subagent_output: false,
+                background_task_reply,
+            }),
+            cx,
+        );
+    }
+
+    pub fn background_tasks(&self) -> impl Iterator<Item = &BackgroundTaskState> {
+        self.entries.iter().filter_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call) => tool_call.background_task.as_ref(),
+            _ => None,
+        })
+    }
+
+    pub fn background_tasks_acknowledged_at(&self) -> i64 {
+        self.background_tasks_acknowledged_at
+    }
+
+    pub fn background_task_entry_index(&self, tool_call_id: &str) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            matches!(entry, AgentThreadEntry::ToolCall(tool_call) if tool_call.id.0.as_ref() == tool_call_id)
+        })
+    }
+
+    pub fn background_task_reply_entry_index(&self, task_id: &str) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            matches!(entry, AgentThreadEntry::AssistantMessage(message)
+                if message.background_task_reply.iter().any(|task| task.task_id == task_id))
+        })
     }
 
     fn streaming_content_target(
@@ -6467,6 +6603,9 @@ impl AcpThread {
         push_user_message: bool,
         cx: &mut Context<Self>,
     ) -> Submission {
+        if push_user_message {
+            self.background_tasks_acknowledged_at = chrono::Utc::now().timestamp_millis();
+        }
         if let Some(submissions) = self.submissions.receipt_transport() {
             let response = submissions.prompt(message.clone(), cx);
             self.submit_receipt(message, response, cx)

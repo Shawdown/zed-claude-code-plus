@@ -52,10 +52,15 @@ use url::Url;
 use util::markdown::source_position_from_fragment;
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
+use super::background_tasks::{
+    BackgroundTasksPopover, finished_since_last_message, format_task_duration, now_millis,
+    task_elapsed, task_name,
+};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
 use super::*;
+use acp_thread::{BackgroundTaskReference, BackgroundTaskStatus};
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 
@@ -611,6 +616,9 @@ pub struct ThreadView {
     acknowledged_confusable_warnings: HashSet<acp_v2::ToolCallId>,
     run_in_background_states: HashMap<acp_v2::ToolCallId, RunInBackgroundState>,
     background_tasks_refused: bool,
+    pub background_tasks_menu_handle: PopoverMenuHandle<BackgroundTasksPopover>,
+    background_task_to_expand: Rc<RefCell<Option<String>>>,
+    _background_task_tick: Option<Task<()>>,
     pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
@@ -1055,6 +1063,9 @@ impl ThreadView {
             acknowledged_confusable_warnings: HashSet::default(),
             run_in_background_states: HashMap::default(),
             background_tasks_refused: false,
+            background_tasks_menu_handle: PopoverMenuHandle::default(),
+            background_task_to_expand: Rc::new(RefCell::new(None)),
+            _background_task_tick: None,
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
@@ -5141,6 +5152,7 @@ impl ThreadView {
                                     )
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx))
+                                    .children(self.render_background_tasks_indicator(cx))
                                     .children(self.render_prompt_cache_indicator(cx)),
                             )
                             .child(
@@ -7380,6 +7392,7 @@ impl ThreadView {
                 chunks,
                 indented: _,
                 is_subagent_output: _,
+                background_task_reply,
             }) => {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
@@ -7426,6 +7439,11 @@ impl ThreadView {
                         .when(is_last, |this| this.pb_4())
                         .w_full()
                         .text_ui(cx)
+                        .children(self.render_background_task_reply_chips(
+                            entry_ix,
+                            background_task_reply,
+                            cx,
+                        ))
                         .child(message_body)
                         .when_some(
                             self.entry_view_state
@@ -9476,6 +9494,176 @@ impl ThreadView {
                 }
             })
             .children(self.render_run_in_background(tool_call, layout, cx))
+            .children(self.render_background_task_badge(tool_call, layout, cx))
+    }
+
+    fn render_background_task_badge(
+        &self,
+        tool_call: &ToolCall,
+        layout: ToolCallLayout,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let task = tool_call.background_task.as_ref()?;
+        let elapsed = format_task_duration(task_elapsed(task, now_millis()));
+        let (label, color) = match task.status {
+            BackgroundTaskStatus::Running => (format!("In background · {elapsed}"), Color::Accent),
+            BackgroundTaskStatus::Completed => ("Done".to_string(), Color::Muted),
+            BackgroundTaskStatus::Failed => (format!("Failed · {elapsed}"), Color::Error),
+            BackgroundTaskStatus::Stopped => (format!("Stopped · {elapsed}"), Color::Warning),
+            BackgroundTaskStatus::Ended => (format!("Ended · {elapsed}"), Color::Muted),
+        };
+        let task_id = task.task_id.clone();
+        Some(
+            h_flex()
+                .when(layout == ToolCallLayout::Standalone, |this| this.mx_5())
+                .mb_1p5()
+                .child(
+                    Button::new(
+                        SharedString::from(format!("background-task-badge-{}", task.task_id)),
+                        label,
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .color(color)
+                    .tooltip(Tooltip::text("Show background task"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_background_task(task_id.clone(), window, cx);
+                    })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_background_task_reply_chips(
+        &self,
+        entry_ix: usize,
+        tasks: &[BackgroundTaskReference],
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if tasks.is_empty() {
+            return None;
+        }
+        let thread = self.thread.read(cx);
+        Some(
+            h_flex()
+                .mb_1p5()
+                .gap_1()
+                .flex_wrap()
+                .children(tasks.iter().enumerate().map(|(task_ix, reference)| {
+                    let name = thread
+                        .background_tasks()
+                        .find(|task| task.task_id == reference.task_id)
+                        .map(task_name)
+                        .unwrap_or_else(|| reference.task_id.clone().into());
+                    let task_id = reference.task_id.clone();
+                    Button::new(
+                        SharedString::from(format!("background-task-reply-{entry_ix}-{task_ix}")),
+                        name,
+                    )
+                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                    .label_size(LabelSize::XSmall)
+                    .start_icon(
+                        Icon::new(IconName::Terminal)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(
+                        "This reply is about a background task that finished",
+                    ))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_background_task(task_id.clone(), window, cx);
+                    }))
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn show_background_task(
+        &mut self,
+        task_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_task_to_expand.replace(Some(task_id));
+        let handle = self.background_tasks_menu_handle.clone();
+        window.defer(cx, move |window, cx| {
+            handle.hide(cx);
+            handle.show(window, cx);
+        });
+    }
+
+    fn render_background_tasks_indicator(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        if thread.background_tasks().next().is_none() {
+            self._background_task_tick = None;
+            return None;
+        }
+        let acknowledged_at = thread.background_tasks_acknowledged_at();
+        let running = thread
+            .background_tasks()
+            .filter(|task| task.is_running())
+            .count();
+        let finished = thread
+            .background_tasks()
+            .filter(|task| finished_since_last_message(task, acknowledged_at))
+            .count();
+
+        if running == 0 {
+            self._background_task_tick = None;
+        } else if self._background_task_tick.is_none() {
+            self._background_task_tick = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                this.update(cx, |this, cx| {
+                    this._background_task_tick = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let tooltip = match (running, finished) {
+            (0, 0) => "No background tasks running".to_string(),
+            (0, finished) => {
+                format!("No background tasks running, {finished} finished since your last message")
+            }
+            (running, 0) => format!("{running} background task{} running", plural(running)),
+            (running, finished) => format!(
+                "{running} background task{} running, {finished} finished since your last message",
+                plural(running)
+            ),
+        };
+
+        let trigger = ButtonLike::new("background-tasks-indicator").child(
+            div().px_1().child(
+                Label::new(running.to_string())
+                    .size(LabelSize::Small)
+                    .color(if running > 0 {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    })
+                    .when(running > 0, |this| this.weight(gpui::FontWeight::MEDIUM)),
+            ),
+        );
+
+        let thread = self.thread.clone();
+        let thread_view = cx.entity().downgrade();
+        let task_to_expand = self.background_task_to_expand.clone();
+        Some(
+            PopoverMenu::new("background-tasks-menu")
+                .with_handle(self.background_tasks_menu_handle.clone())
+                .trigger_with_tooltip(trigger, Tooltip::text(tooltip))
+                .anchor(gpui::Anchor::BottomLeft)
+                .menu(move |_window, cx| {
+                    let expand_task = task_to_expand.take();
+                    let thread = thread.clone();
+                    let thread_view = thread_view.clone();
+                    Some(cx.new(|cx| {
+                        BackgroundTasksPopover::new(thread, thread_view, expand_task, cx)
+                    }))
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_run_in_background(
