@@ -117,13 +117,8 @@ jobs:
         2. The installer replaces the official Zed and keeps your settings, extensions and threads. It is unsigned, so SmartScreen may warn when you run a downloaded file: choose **More info → Run anyway**.
         3. From 1.25.2-plus.3 on, Zed updates itself from this repository's releases instead of the official ones. If your settings.json still has \`"auto_update": false\` from an earlier build, remove it to turn updates on.
 
-        ### Additions
-        - Editing previous messages for agents that advertise \`claudeCodePlus\` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
-        - \`agent.wrap_terminal_commands\` setting and a hover button on command blocks to toggle wrapping.
-        - Auto-updates from this repository's releases.
-        - Shows plan usage limits (session and weekly) in the context usage tooltip, with claude-agent-acp-plus 0.94.0-plus.10 or later.
-        - \`/clear\`, \`/reset\` and \`/new\` open a new thread for the same agent when it advertises \`newThreadCommands\` (claude-agent-acp-plus 0.94.0-plus.8+).
         NOTES
+        cat .github/claude-plus/RELEASE_NOTES.md >> notes.md
         if ! output=$(gh release create "v${VERSION}" dist/* \
           --repo "$GITHUB_REPOSITORY" \
           --target "$GITHUB_SHA" \
