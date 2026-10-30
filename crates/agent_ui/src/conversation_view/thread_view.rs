@@ -8444,15 +8444,22 @@ impl ThreadView {
         let entries = thread.entries();
         let mut user_message_indices = Vec::new();
         let mut assistant_markers = Vec::new();
+        let mut turn_answer_marker = None;
         for (entry_ix, entry) in entries.iter().enumerate() {
             match entry {
-                AgentThreadEntry::UserMessage(_) => user_message_indices.push(entry_ix),
+                AgentThreadEntry::UserMessage(_) => {
+                    assistant_markers.extend(turn_answer_marker.take());
+                    user_message_indices.push(entry_ix);
+                }
                 AgentThreadEntry::AssistantMessage(message) => {
-                    assistant_markers.extend(assistant_message_markers(entry_ix, message, cx));
+                    if let Some(marker) = assistant_reply_marker(entry_ix, message, cx) {
+                        turn_answer_marker = Some(marker);
+                    }
                 }
                 _ => {}
             }
         }
+        assistant_markers.extend(turn_answer_marker);
         let last_user_message_index = user_message_indices.last().copied();
         if last_user_message_index.is_none() && assistant_markers.is_empty() {
             return None;
@@ -8486,11 +8493,6 @@ impl ThreadView {
                         marker_position(marker.entry_ix, marker.fraction_of_entry)?;
                     let offset_in_item = item_height * marker.fraction_of_entry;
                     let entry_ix = marker.entry_ix;
-                    let (marker_size, opacity) = match marker.kind {
-                        AssistantMarkerKind::Message => (gpui::size(px(4.), px(2.)), 0.75),
-                        AssistantMarkerKind::Thinking => (gpui::size(px(2.), px(2.)), 0.4),
-                    };
-                    let kind = marker.kind;
                     let preview = marker.preview;
                     Some(
                         div()
@@ -8506,28 +8508,13 @@ impl ThreadView {
                             .justify_end()
                             .cursor_pointer()
                             .occlude()
-                            .opacity(opacity)
+                            .opacity(0.75)
                             .hover(|style| style.opacity(1.))
-                            .child(
-                                div()
-                                    .w(marker_size.width)
-                                    .h(marker_size.height)
-                                    .when(marker.kind == AssistantMarkerKind::Message, |this| {
-                                        this.rounded_xs()
-                                    })
-                                    .bg(claude_color),
-                            )
+                            .child(div().w(px(4.)).h(px(2.)).rounded_xs().bg(claude_color))
                             .tooltip(Tooltip::element(move |_window, _cx| {
-                                let label = Label::new(preview.clone());
-                                match kind {
-                                    AssistantMarkerKind::Message => {
-                                        label.color(Color::Custom(claude_color))
-                                    }
-                                    AssistantMarkerKind::Thinking => {
-                                        label.color(Color::Muted).italic()
-                                    }
-                                }
-                                .into_any_element()
+                                Label::new(preview.clone())
+                                    .color(Color::Custom(claude_color))
+                                    .into_any_element()
                             }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.list_state.scroll_to(ListOffset {
@@ -16144,47 +16131,39 @@ pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
     .detach();
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AssistantMarkerKind {
-    Message,
-    Thinking,
-}
-
 struct AssistantMarker {
     entry_ix: usize,
     fraction_of_entry: f32,
-    kind: AssistantMarkerKind,
     preview: SharedString,
 }
 
-fn assistant_message_markers(
+fn assistant_reply_marker(
     entry_ix: usize,
     message: &AssistantMessage,
     cx: &App,
-) -> Vec<AssistantMarker> {
+) -> Option<AssistantMarker> {
     let chunk_count = message.chunks.len();
-    let mut markers: Vec<AssistantMarker> = Vec::new();
-    let mut previous_kind = None;
+    let mut reply_marker = None;
+    let mut previous_chunk_was_message = false;
     for (chunk_ix, chunk) in message.chunks.iter().enumerate() {
-        let (kind, block) = match chunk {
-            AssistantMessageChunk::Message { block, .. } => (AssistantMarkerKind::Message, block),
-            AssistantMessageChunk::Thought { block, .. } => (AssistantMarkerKind::Thinking, block),
+        let AssistantMessageChunk::Message { block, .. } = chunk else {
+            previous_chunk_was_message = false;
+            continue;
         };
-        if previous_kind == Some(kind) {
+        if previous_chunk_was_message {
             continue;
         }
         let Some(preview) = first_line_preview(&block.to_markdown(cx)) else {
             continue;
         };
-        previous_kind = Some(kind);
-        markers.push(AssistantMarker {
+        previous_chunk_was_message = true;
+        reply_marker = Some(AssistantMarker {
             entry_ix,
             fraction_of_entry: chunk_ix as f32 / chunk_count as f32,
-            kind,
             preview,
         });
     }
-    markers
+    reply_marker
 }
 
 fn user_message_preview(entry: &AgentThreadEntry, cx: &App) -> Option<SharedString> {
