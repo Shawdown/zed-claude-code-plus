@@ -3624,7 +3624,6 @@ pub struct AcpThread {
     // Notices stay with the live session, but never enter conversation history or exports.
     notices: Vec<(usize, acp_v2::Notice)>,
     next_notice_id: usize,
-    background_tasks_acknowledged_at: i64,
     elicitations: ElicitationStore,
     permission_requests: IndexMap<PermissionRequestId, PermissionRequest>,
     plans: HashMap<PlanIdentity, Plan>,
@@ -3999,7 +3998,6 @@ impl AcpThread {
             entries: Default::default(),
             notices: Vec::new(),
             next_notice_id: 0,
-            background_tasks_acknowledged_at: 0,
             elicitations: ElicitationStore::default(),
             permission_requests: IndexMap::default(),
             subagents: IndexMap::default(),
@@ -5410,10 +5408,6 @@ impl AcpThread {
             AgentThreadEntry::ToolCall(tool_call) => tool_call.background_task.as_ref(),
             _ => None,
         })
-    }
-
-    pub fn background_tasks_acknowledged_at(&self) -> i64 {
-        self.background_tasks_acknowledged_at
     }
 
     pub fn background_task_entry_index(&self, tool_call_id: &str) -> Option<usize> {
@@ -6883,9 +6877,6 @@ impl AcpThread {
         push_user_message: bool,
         cx: &mut Context<Self>,
     ) -> Submission {
-        if push_user_message {
-            self.background_tasks_acknowledged_at = chrono::Utc::now().timestamp_millis();
-        }
         let id = self.register_submission(message.clone().into(), cx);
         match self.submissions.transport().clone() {
             SubmissionTransport::Receipt(submissions) => {

@@ -54,8 +54,7 @@ use util::markdown::source_position_from_fragment;
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
 use super::background_tasks::{
-    BackgroundTasksPopover, finished_since_last_message, format_task_duration, now_millis,
-    task_elapsed, task_name,
+    BackgroundTasksPopover, format_task_duration, now_millis, task_elapsed, task_name,
 };
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
@@ -9930,14 +9929,9 @@ impl ThreadView {
             self._background_task_tick = None;
             return None;
         }
-        let acknowledged_at = thread.background_tasks_acknowledged_at();
         let running = thread
             .background_tasks()
             .filter(|task| task.is_running())
-            .count();
-        let finished = thread
-            .background_tasks()
-            .filter(|task| finished_since_last_message(task, acknowledged_at))
             .count();
 
         if running == 0 {
@@ -9954,16 +9948,9 @@ impl ThreadView {
         }
 
         let plural = |count: usize| if count == 1 { "" } else { "s" };
-        let tooltip = match (running, finished) {
-            (0, 0) => "No background tasks running".to_string(),
-            (0, finished) => {
-                format!("No background tasks running, {finished} finished since your last message")
-            }
-            (running, 0) => format!("{running} background task{} running", plural(running)),
-            (running, finished) => format!(
-                "{running} background task{} running, {finished} finished since your last message",
-                plural(running)
-            ),
+        let tooltip = match running {
+            0 => "No background tasks running".to_string(),
+            running => format!("{running} background task{} running", plural(running)),
         };
 
         let trigger = ButtonLike::new("background-tasks-indicator").child(

@@ -56,16 +56,6 @@ fn status_description(task: &BackgroundTaskState) -> &'static str {
     }
 }
 
-pub(crate) fn finished_since_last_message(
-    task: &BackgroundTaskState,
-    acknowledged_at: i64,
-) -> bool {
-    !task.is_running()
-        && task
-            .ended_at
-            .is_some_and(|ended_at| ended_at >= acknowledged_at)
-}
-
 pub(crate) fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -82,6 +72,7 @@ pub struct BackgroundTasksPopover {
     controls: Option<Rc<dyn AgentSessionBackgroundTasks>>,
     focus_handle: FocusHandle,
     expanded: HashSet<String>,
+    focused_task: Option<String>,
     outputs: HashMap<String, OutputState>,
     stopping: HashSet<String>,
     errors: HashMap<String, SharedString>,
@@ -110,6 +101,7 @@ impl BackgroundTasksPopover {
             controls,
             focus_handle: cx.focus_handle(),
             expanded: HashSet::default(),
+            focused_task: expand_task.clone(),
             outputs: HashMap::default(),
             stopping: HashSet::default(),
             errors: HashMap::default(),
@@ -468,20 +460,20 @@ impl BackgroundTasksPopover {
 impl Render for BackgroundTasksPopover {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = now_millis();
-        let (running, finished) = {
+        let (running, focused_finished) = {
             let thread = self.thread.read(cx);
-            let acknowledged_at = thread.background_tasks_acknowledged_at();
             let running: Vec<BackgroundTaskState> = thread
                 .background_tasks()
                 .filter(|task| task.is_running())
                 .cloned()
                 .collect();
-            let finished: Vec<BackgroundTaskState> = thread
-                .background_tasks()
-                .filter(|task| finished_since_last_message(task, acknowledged_at))
-                .cloned()
-                .collect();
-            (running, finished)
+            let focused_finished = self.focused_task.as_ref().and_then(|task_id| {
+                thread
+                    .background_tasks()
+                    .find(|task| &task.task_id == task_id && !task.is_running())
+                    .cloned()
+            });
+            (running, focused_finished)
         };
         self.schedule_tick(!running.is_empty(), cx);
 
@@ -517,7 +509,7 @@ impl Render for BackgroundTasksPopover {
                             .color(Color::Muted),
                     ),
             )
-            .when(running.is_empty() && finished.is_empty(), |this| {
+            .when(running.is_empty() && focused_finished.is_none(), |this| {
                 this.child(
                     div().px_1().py_2().child(
                         Label::new("No background tasks running")
@@ -534,14 +526,8 @@ impl Render for BackgroundTasksPopover {
                         .collect::<Vec<_>>(),
                 )
             })
-            .when(!finished.is_empty(), |this| {
-                this.child(section("Finished since your last message"))
-                    .children(
-                        finished
-                            .iter()
-                            .map(|task| self.render_task(task, now, cx))
-                            .collect::<Vec<_>>(),
-                    )
+            .when_some(focused_finished, |this, task| {
+                this.child(self.render_task(&task, now, cx))
             })
     }
 }

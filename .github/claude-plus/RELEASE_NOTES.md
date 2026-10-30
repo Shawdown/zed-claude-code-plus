@@ -1,5 +1,5 @@
 ### What's new in this release
-- The thread scrollbar marks only Claude's final answer for each prompt. Narration between tool calls and thinking no longer get markers, so long agent runs stay readable.
+- The background tasks list shows only running tasks. The "Finished since your last message" section is gone; a finished task you open from the thread still shows up there.
 
 ### Features
 - Edit previous messages for agents that advertise `claudeCodePlus` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
