@@ -6924,6 +6924,44 @@ struct TokenUsageTooltip {
     workspace: WeakEntity<Workspace>,
 }
 
+const MESSAGE_TIMESTAMP_GROUP: &str = "message-timestamp";
+
+fn message_timestamp_labels(
+    timestamp: chrono::DateTime<chrono::Local>,
+    today: chrono::NaiveDate,
+) -> (String, String) {
+    let short = if timestamp.date_naive() == today {
+        timestamp.format("%H:%M").to_string()
+    } else {
+        timestamp.format("%b %-d, %H:%M").to_string()
+    };
+    let full = timestamp.format("%A, %B %-d, %Y, %H:%M:%S").to_string();
+    (short, full)
+}
+
+fn render_message_timestamp(
+    entry_ix: usize,
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    background: Hsla,
+) -> Option<AnyElement> {
+    let timestamp = timestamp?.with_timezone(&chrono::Local);
+    let (short, full) = message_timestamp_labels(timestamp, chrono::Local::now().date_naive());
+    Some(
+        div()
+            .id(("message-timestamp", entry_ix))
+            .absolute()
+            .bottom_1()
+            .right_1()
+            .px_1()
+            .rounded_sm()
+            .bg(background)
+            .visible_on_hover(MESSAGE_TIMESTAMP_GROUP)
+            .tooltip(Tooltip::text(full))
+            .child(Label::new(short).size(LabelSize::XSmall).color(Color::Muted))
+            .into_any_element(),
+    )
+}
+
 fn plan_usage_reset_label(resets_at: chrono::DateTime<chrono::Utc>) -> String {
     let remaining = resets_at - chrono::Utc::now();
     if remaining <= chrono::TimeDelta::zero() {
@@ -7562,6 +7600,7 @@ impl ThreadView {
 
                 v_flex()
                     .id(("user_message", entry_ix))
+                    .group(MESSAGE_TIMESTAMP_GROUP)
                     .map(|this| {
                         if is_first_indented {
                             this.pt_0p5()
@@ -7629,6 +7668,13 @@ impl ThreadView {
                                     .text_xs()
                                     .child(editor.clone().into_any_element())
                             )
+                            .when(!editing, |this| {
+                                this.children(render_message_timestamp(
+                                    entry_ix,
+                                    message.timestamp,
+                                    cx.theme().colors().editor_background,
+                                ))
+                            })
                             .when(editor_focus, |this| {
                                 let base_container = h_flex()
                                     .absolute()
@@ -7719,6 +7765,7 @@ impl ThreadView {
                 indented: _,
                 is_subagent_output: _,
                 background_task_reply,
+                timestamp,
             }) => {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
@@ -7760,6 +7807,8 @@ impl ThreadView {
                     Empty.into_any()
                 } else {
                     v_flex()
+                        .relative()
+                        .group(MESSAGE_TIMESTAMP_GROUP)
                         .px_5()
                         .py_1p5()
                         .when(is_last, |this| this.pb_4())
@@ -7771,6 +7820,11 @@ impl ThreadView {
                             cx,
                         ))
                         .child(message_body)
+                        .children(render_message_timestamp(
+                            entry_ix,
+                            *timestamp,
+                            cx.theme().colors().panel_background,
+                        ))
                         .when_some(
                             self.entry_view_state
                                 .read(cx)
@@ -14964,6 +15018,26 @@ mod tests {
     use std::sync::Once;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_message_timestamp_labels() {
+        let timestamp = chrono::NaiveDate::from_ymd_opt(2026, 11, 3)
+            .and_then(|date| date.and_hms_opt(9, 5, 7))
+            .and_then(|time| time.and_local_timezone(chrono::Local).single())
+            .expect("valid local time");
+        let full = "Tuesday, November 3, 2026, 09:05:07".to_string();
+        assert_eq!(
+            message_timestamp_labels(timestamp, timestamp.date_naive()),
+            ("09:05".to_string(), full.clone())
+        );
+        assert_eq!(
+            message_timestamp_labels(
+                timestamp,
+                timestamp.date_naive() + chrono::TimeDelta::days(1)
+            ),
+            ("Nov 3, 09:05".to_string(), full)
+        );
+    }
 
     #[test]
     fn test_reported_activity_completion_status() {

@@ -318,6 +318,7 @@ pub fn runs_in_foreground_from_meta(meta: &Option<acp_v2::Meta>) -> Option<bool>
 
 pub const BACKGROUND_TASK_META_KEY: &str = "claudeCodePlus/backgroundTask";
 pub const BACKGROUND_TASK_REPLY_META_KEY: &str = "claudeCodePlus/backgroundTaskReply";
+pub const MESSAGE_TIMESTAMP_META_KEY: &str = "claudeCodePlus/timestamp";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -384,6 +385,13 @@ pub fn background_task_reply_from_meta(
         .unwrap_or_default()
 }
 
+pub fn message_timestamp_from_meta(meta: &Option<acp_v2::Meta>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let timestamp = meta.as_ref()?.get(MESSAGE_TIMESTAMP_META_KEY)?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+}
+
 pub fn sandbox_not_applied_from_meta(
     meta: &Option<acp_v2::Meta>,
 ) -> Option<SandboxNotAppliedReason> {
@@ -419,6 +427,7 @@ pub struct UserMessage {
     pub content: MessageContent,
     pub checkpoint: Option<Checkpoint>,
     pub indented: bool,
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -467,6 +476,7 @@ pub struct AssistantMessage {
     pub indented: bool,
     pub is_subagent_output: bool,
     pub background_task_reply: Vec<BackgroundTaskReference>,
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl AssistantMessage {
@@ -4760,6 +4770,23 @@ impl AcpThread {
         false
     }
 
+    fn record_message_timestamp(&mut self, meta: &Option<acp_v2::Meta>) {
+        let Some(timestamp) = message_timestamp_from_meta(meta)
+            .or_else(|| self.running_turn.is_some().then(chrono::Utc::now))
+        else {
+            return;
+        };
+        match self.entries.last_mut() {
+            Some(AgentThreadEntry::UserMessage(message)) => {
+                message.timestamp.get_or_insert(timestamp);
+            }
+            Some(AgentThreadEntry::AssistantMessage(message)) => {
+                message.timestamp.get_or_insert(timestamp);
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_session_update(
         &mut self,
         update: acp_v1::SessionUpdate,
@@ -4769,6 +4796,7 @@ impl AcpThread {
             acp_v1::SessionUpdate::UserMessageChunk(acp_v1::ContentChunk {
                 content,
                 message_id,
+                meta,
                 ..
             }) => {
                 let content = content::from_v1(content).map_err(acp_v1::Error::from)?;
@@ -4797,6 +4825,7 @@ impl AcpThread {
                 if !already_in_user_message {
                     self.push_user_content_block_from_agent(message_id, content, cx);
                 }
+                self.record_message_timestamp(&meta);
             }
             acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk {
                 content,
@@ -4813,10 +4842,12 @@ impl AcpThread {
                 } else {
                     self.push_background_task_reply(message_id, content, background_task_reply, cx);
                 }
+                self.record_message_timestamp(&meta);
             }
             acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk {
                 content,
                 message_id,
+                meta,
                 ..
             }) => {
                 self.push_assistant_content_block_with_message_id(
@@ -4826,6 +4857,7 @@ impl AcpThread {
                     false,
                     cx,
                 );
+                self.record_message_timestamp(&meta);
             }
             acp_v1::SessionUpdate::ToolCall(tool_call) => {
                 self.upsert_tool_call(tool_call, cx)?;
@@ -5087,6 +5119,7 @@ impl AcpThread {
                         content: MessageContent::default(),
                         checkpoint: None,
                         indented: false,
+                        timestamp: None,
                     }));
                 Ok(MessageLocation::User { entry_index })
             }
@@ -5121,6 +5154,7 @@ impl AcpThread {
                             indented: false,
                             is_subagent_output: false,
                             background_task_reply: Vec::new(),
+                            timestamp: None,
                         }));
                     Ok(MessageLocation::Assistant {
                         entry_index,
@@ -5243,6 +5277,7 @@ impl AcpThread {
                     content,
                     checkpoint: None,
                     indented,
+                    timestamp: None,
                 }),
                 cx,
             );
@@ -5305,6 +5340,7 @@ impl AcpThread {
                 indented: existing_indented,
                 is_subagent_output: _,
                 background_task_reply: _,
+                timestamp: _,
             }) = last_entry
             && *existing_indented == indented
         {
@@ -5371,6 +5407,7 @@ impl AcpThread {
                     indented,
                     is_subagent_output: false,
                     background_task_reply: Vec::new(),
+                    timestamp: None,
                 }),
                 cx,
             );
@@ -5398,6 +5435,7 @@ impl AcpThread {
                 indented: false,
                 is_subagent_output: false,
                 background_task_reply,
+                timestamp: None,
             }),
             cx,
         );
@@ -7045,6 +7083,7 @@ impl AcpThread {
                             content: block,
                             checkpoint: None,
                             indented: false,
+                            timestamp: Some(chrono::Utc::now()),
                         }),
                         cx,
                     );
@@ -14193,6 +14232,100 @@ mod tests {
             current_markdown.read_with(cx, |markdown, _| markdown.source().to_string()),
             "fresh replacement tail[@https://example.com/](https://example.com/) final",
         );
+    }
+
+    #[gpui::test]
+    async fn test_replayed_messages_take_their_time_from_meta(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let timestamp_meta = |timestamp: &str| {
+            acp_v1::Meta::from_iter([(MESSAGE_TIMESTAMP_META_KEY.into(), json!(timestamp))])
+        };
+        thread.update(cx, |thread, cx| {
+            for update in [
+                acp_v1::SessionUpdate::UserMessageChunk(
+                    acp_v1::ContentChunk::new("hi".into())
+                        .meta(timestamp_meta("2026-11-01T09:15:00Z")),
+                ),
+                acp_v1::SessionUpdate::AgentMessageChunk(
+                    acp_v1::ContentChunk::new("hello".into())
+                        .meta(timestamp_meta("2026-11-01T09:16:30Z")),
+                ),
+                acp_v1::SessionUpdate::AgentMessageChunk(
+                    acp_v1::ContentChunk::new(" there".into())
+                        .meta(timestamp_meta("2026-11-01T09:17:00Z")),
+                ),
+                acp_v1::SessionUpdate::UserMessageChunk(acp_v1::ContentChunk::new(
+                    "again".into(),
+                )),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new("ok".into())),
+            ] {
+                thread
+                    .handle_session_update(update, cx)
+                    .expect("replayed chunk");
+            }
+        });
+        thread.read_with(cx, |thread, _| {
+            let timestamps = thread
+                .entries()
+                .iter()
+                .map(|entry| match entry {
+                    AgentThreadEntry::UserMessage(message) => message.timestamp,
+                    AgentThreadEntry::AssistantMessage(message) => message.timestamp,
+                    _ => panic!("only messages are replayed"),
+                })
+                .map(|timestamp| timestamp.map(|timestamp| timestamp.to_rfc3339()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                timestamps,
+                vec![
+                    Some("2026-11-01T09:15:00+00:00".to_string()),
+                    Some("2026-11-01T09:16:30+00:00".to_string()),
+                    None,
+                    None,
+                ]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_live_messages_without_time_meta_use_the_current_time(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("stub session");
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("answer".into()),
+        )]);
+        let before = chrono::Utc::now();
+        thread
+            .update(cx, |thread, cx| thread.send_raw("question", cx))
+            .await
+            .expect("prompt completes");
+        let after = chrono::Utc::now();
+        thread.read_with(cx, |thread, _| {
+            let [
+                AgentThreadEntry::UserMessage(user_message),
+                AgentThreadEntry::AssistantMessage(assistant_message),
+            ] = thread.entries()
+            else {
+                panic!("a user message and a reply");
+            };
+            for timestamp in [user_message.timestamp, assistant_message.timestamp] {
+                let timestamp = timestamp.expect("live message has a time");
+                assert!(before <= timestamp && timestamp <= after);
+            }
+        });
     }
 
     #[gpui::test]
@@ -21624,6 +21757,7 @@ mod tests {
                     content,
                     checkpoint: None,
                     indented: false,
+                    timestamp: Some(chrono::Utc::now()),
                 }),
                 cx,
             );

@@ -448,6 +448,10 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        (
+            CLAUDE_CODE_PLUS_META_KEY.into(),
+            serde_json::json!({ "messageTimestamps": true }),
+        ),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -5813,6 +5817,19 @@ mod tests {
         );
         assert_eq!(meta.get("terminal_output"), Some(&serde_json::json!(true)));
         assert_eq!(meta.get("terminal-auth"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn client_capabilities_ask_for_message_timestamps() {
+        let capabilities = client_capabilities_for_agent(&AgentId::new("claude-acp"));
+        let meta = capabilities
+            .meta
+            .expect("expected client capabilities meta");
+
+        assert_eq!(
+            meta.get(CLAUDE_CODE_PLUS_META_KEY),
+            Some(&serde_json::json!({ "messageTimestamps": true }))
+        );
     }
 
     #[test]

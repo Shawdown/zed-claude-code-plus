@@ -1,5 +1,5 @@
 ### What's new in this release
-- The background tasks list shows only running tasks. The "Finished since your last message" section is gone; a finished task you open from the thread still shows up there.
+- Hover a message or a reply to see when it was sent, at its bottom right. Hover the time for the full date (claude-agent-acp-plus 0.94.0-plus.24+ for reloaded threads).
 
 ### Features
 - Edit previous messages for agents that advertise `claudeCodePlus` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
@@ -13,6 +13,7 @@
 - `agent.wrap_terminal_commands` setting and a hover button on command blocks to toggle wrapping.
 - `agent.show_add_context_button`, `agent.show_follow_button` and `agent.hidden_config_options` settings to hide message editor controls.
 - Thread history shows the last interaction time.
+- Message and reply times on hover (claude-agent-acp-plus 0.94.0-plus.24+ for reloaded threads).
 - Tool call locations without a text buffer, such as images, can be opened.
 - Agent login runs the agent's own command and shows login errors.
 - Dock panel sizes are shared across projects.

@@ -1290,13 +1290,15 @@ mod tests {
             let view = cx.update(|cx| {
                 let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
                 let agent_server: Rc<dyn AgentServer> = agent_server.clone();
-                cx.new(|_| ConfigOptionsView {
+                cx.new(|cx| ConfigOptionsView {
                     config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                     config_options,
                     selectors: Vec::new(),
                     agent_server,
                     fs,
                     _refresh_task: Task::ready(()),
+                    _settings_subscription: cx
+                        .observe_global::<SettingsStore>(|_, cx| cx.notify()),
                 })
             });
             let rejected = config_options.defer_next_response();
