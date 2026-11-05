@@ -1,5 +1,5 @@
 ### What's new in this release
-- Hover a message or a reply to see when it was sent, at its bottom right. Hover the time for the full date (claude-agent-acp-plus 0.94.0-plus.24+ for reloaded threads).
+- Based on Zed v1.27.0.
 
 ### Features
 - Edit previous messages for agents that advertise `claudeCodePlus` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
