@@ -36,6 +36,11 @@ use futures::{
 use git::{
     BuildPermalinkParams, GitHostingProviderRegistry, Oid, RunHook,
     blame::Blame,
+    operation::{
+        ApplyCommitsOptions, ConflictPreference, FastForward, GitOperation, GitOperationKind,
+        GitOperationOutcome, GitOperationPreview, GitOperationPreviewRequest, GitOperationState,
+        MergeOptions, PreviewCommit,
+    },
     parse_git_remote_url,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
@@ -589,6 +594,7 @@ pub struct RepositoryId(pub u64);
 pub struct MergeDetails {
     pub merge_heads_by_conflicted_path: TreeMap<RepoPath, Vec<Option<SharedString>>>,
     pub message: Option<SharedString>,
+    pub operation: Option<GitOperationState>,
 }
 
 #[derive(Clone)]
@@ -1048,6 +1054,8 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_git_init);
         client.add_entity_request_handler(Self::handle_push);
         client.add_entity_request_handler(Self::handle_pull);
+        client.add_entity_request_handler(Self::handle_run_git_operation);
+        client.add_entity_request_handler(Self::handle_preview_git_operation);
         client.add_entity_request_handler(Self::handle_fetch);
         client.add_entity_request_handler(Self::handle_stage);
         client.add_entity_request_handler(Self::handle_unstage);
@@ -3525,6 +3533,73 @@ impl GitStore {
             stdout: remote_message.stdout,
             stderr: remote_message.stderr,
         })
+    }
+
+    async fn handle_run_git_operation(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::RunGitOperation>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::RunGitOperationResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let operation = git_operation_from_proto(
+            envelope
+                .payload
+                .operation
+                .context("missing git operation")?,
+        )?;
+        let askpass_id = envelope.payload.askpass_id;
+        let askpass = make_remote_delegate(
+            this,
+            envelope.payload.project_id,
+            repository_id,
+            askpass_id,
+            &mut cx,
+        );
+
+        let outcome = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.run_git_operation(operation, askpass, cx)
+            })
+            .await??;
+
+        Ok(proto::RunGitOperationResponse {
+            stopped: outcome.stopped,
+            stdout: outcome.output.stdout,
+            stderr: outcome.output.stderr,
+        })
+    }
+
+    async fn handle_preview_git_operation(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::PreviewGitOperation>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::PreviewGitOperationResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let request = match envelope
+            .payload
+            .request
+            .context("missing preview request")?
+        {
+            proto::preview_git_operation::Request::MergeSource(source) => {
+                GitOperationPreviewRequest::Merge { source }
+            }
+            proto::preview_git_operation::Request::CherryPick(cherry_pick) => {
+                GitOperationPreviewRequest::CherryPick {
+                    revisions: cherry_pick.revisions,
+                    mainline: cherry_pick.mainline,
+                }
+            }
+        };
+
+        let preview = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.preview_git_operation(request)
+            })
+            .await??;
+
+        Ok(preview_to_proto(preview))
     }
 
     async fn handle_stage(
@@ -6005,6 +6080,7 @@ impl RepositorySnapshot {
                 .map(|(repo_path, _)| repo_path.as_unix_str().to_owned())
                 .collect(),
             merge_message: self.merge.message.as_ref().map(|msg| msg.to_string()),
+            operation_state: self.merge.operation.as_ref().map(operation_state_to_proto),
             project_id,
             id: self.id.to_proto(),
             abs_path: self.work_directory_abs_path.to_string_lossy().into_owned(),
@@ -6092,6 +6168,7 @@ impl RepositorySnapshot {
                 .map(|(path, _)| path.as_unix_str().to_owned())
                 .collect(),
             merge_message: self.merge.message.as_ref().map(|msg| msg.to_string()),
+            operation_state: self.merge.operation.as_ref().map(operation_state_to_proto),
             project_id,
             id: self.id.to_proto(),
             abs_path: self.work_directory_abs_path.to_string_lossy().into_owned(),
@@ -6284,6 +6361,193 @@ pub fn proto_to_stash(entry: &proto::StashEntry) -> Result<StashEntry> {
     })
 }
 
+fn operation_kind_to_proto(kind: GitOperationKind) -> proto::git_operation_state::Kind {
+    match kind {
+        GitOperationKind::Merge => proto::git_operation_state::Kind::Merge,
+        GitOperationKind::CherryPick => proto::git_operation_state::Kind::CherryPick,
+        GitOperationKind::Revert => proto::git_operation_state::Kind::Revert,
+        GitOperationKind::Rebase => proto::git_operation_state::Kind::Rebase,
+    }
+}
+
+fn operation_kind_from_proto(kind: i32) -> Result<GitOperationKind> {
+    Ok(match proto::git_operation_state::Kind::try_from(kind)? {
+        proto::git_operation_state::Kind::Merge => GitOperationKind::Merge,
+        proto::git_operation_state::Kind::CherryPick => GitOperationKind::CherryPick,
+        proto::git_operation_state::Kind::Revert => GitOperationKind::Revert,
+        proto::git_operation_state::Kind::Rebase => GitOperationKind::Rebase,
+    })
+}
+
+fn operation_state_to_proto(state: &GitOperationState) -> proto::GitOperationState {
+    proto::GitOperationState {
+        kind: operation_kind_to_proto(state.kind).into(),
+        current_commit: state
+            .current_commit
+            .as_ref()
+            .map(|commit| commit.to_string()),
+        remaining_commits: state.remaining_commits as u64,
+    }
+}
+
+fn operation_state_from_proto(state: &proto::GitOperationState) -> Result<GitOperationState> {
+    Ok(GitOperationState {
+        kind: operation_kind_from_proto(state.kind)?,
+        current_commit: state.current_commit.clone().map(SharedString::from),
+        remaining_commits: state.remaining_commits as usize,
+    })
+}
+
+fn apply_commits_to_proto(
+    commits: &[String],
+    options: &ApplyCommitsOptions,
+) -> proto::ApplyCommitsOperation {
+    proto::ApplyCommitsOperation {
+        commits: commits.to_vec(),
+        commit: options.commit,
+        record_origin: options.record_origin,
+        mainline: options.mainline,
+        signoff: options.signoff,
+    }
+}
+
+fn apply_commits_from_proto(
+    operation: proto::ApplyCommitsOperation,
+) -> (Vec<String>, ApplyCommitsOptions) {
+    (
+        operation.commits,
+        ApplyCommitsOptions {
+            commit: operation.commit,
+            record_origin: operation.record_origin,
+            mainline: operation.mainline,
+            signoff: operation.signoff,
+        },
+    )
+}
+
+fn git_operation_to_proto(operation: &GitOperation) -> proto::run_git_operation::Operation {
+    use proto::run_git_operation::Operation;
+    match operation {
+        GitOperation::Merge(options) => Operation::Merge(proto::MergeOperation {
+            source: options.source.clone(),
+            fast_forward: match options.fast_forward {
+                FastForward::Auto => proto::merge_operation::FastForward::Auto,
+                FastForward::Only => proto::merge_operation::FastForward::Only,
+                FastForward::Never => proto::merge_operation::FastForward::Never,
+            }
+            .into(),
+            squash: options.squash,
+            commit: options.commit,
+            signoff: options.signoff,
+            prefer: options.prefer.map(|prefer| {
+                match prefer {
+                    ConflictPreference::Ours => proto::merge_operation::ConflictPreference::Ours,
+                    ConflictPreference::Theirs => {
+                        proto::merge_operation::ConflictPreference::Theirs
+                    }
+                }
+                .into()
+            }),
+            allow_unrelated_histories: options.allow_unrelated_histories,
+        }),
+        GitOperation::CherryPick { commits, options } => {
+            Operation::CherryPick(apply_commits_to_proto(commits, options))
+        }
+        GitOperation::Revert { commits, options } => {
+            Operation::Revert(apply_commits_to_proto(commits, options))
+        }
+        GitOperation::Continue(kind) => {
+            Operation::ContinueOperation(operation_kind_to_proto(*kind).into())
+        }
+        GitOperation::Skip(kind) => Operation::SkipOperation(operation_kind_to_proto(*kind).into()),
+        GitOperation::Abort(kind) => {
+            Operation::AbortOperation(operation_kind_to_proto(*kind).into())
+        }
+    }
+}
+
+fn git_operation_from_proto(
+    operation: proto::run_git_operation::Operation,
+) -> Result<GitOperation> {
+    use proto::run_git_operation::Operation;
+    Ok(match operation {
+        Operation::Merge(merge) => GitOperation::Merge(MergeOptions {
+            fast_forward: match proto::merge_operation::FastForward::try_from(merge.fast_forward)? {
+                proto::merge_operation::FastForward::Auto => FastForward::Auto,
+                proto::merge_operation::FastForward::Only => FastForward::Only,
+                proto::merge_operation::FastForward::Never => FastForward::Never,
+            },
+            prefer: merge
+                .prefer
+                .map(proto::merge_operation::ConflictPreference::try_from)
+                .transpose()?
+                .map(|prefer| match prefer {
+                    proto::merge_operation::ConflictPreference::Ours => ConflictPreference::Ours,
+                    proto::merge_operation::ConflictPreference::Theirs => {
+                        ConflictPreference::Theirs
+                    }
+                }),
+            source: merge.source,
+            squash: merge.squash,
+            commit: merge.commit,
+            signoff: merge.signoff,
+            allow_unrelated_histories: merge.allow_unrelated_histories,
+        }),
+        Operation::CherryPick(cherry_pick) => {
+            let (commits, options) = apply_commits_from_proto(cherry_pick);
+            GitOperation::CherryPick { commits, options }
+        }
+        Operation::Revert(revert) => {
+            let (commits, options) = apply_commits_from_proto(revert);
+            GitOperation::Revert { commits, options }
+        }
+        Operation::ContinueOperation(kind) => {
+            GitOperation::Continue(operation_kind_from_proto(kind)?)
+        }
+        Operation::SkipOperation(kind) => GitOperation::Skip(operation_kind_from_proto(kind)?),
+        Operation::AbortOperation(kind) => GitOperation::Abort(operation_kind_from_proto(kind)?),
+    })
+}
+
+fn preview_to_proto(preview: GitOperationPreview) -> proto::PreviewGitOperationResponse {
+    proto::PreviewGitOperationResponse {
+        commits: preview
+            .commits
+            .into_iter()
+            .map(|commit| proto::PreviewCommit {
+                sha: commit.sha.to_string(),
+                subject: commit.subject.to_string(),
+            })
+            .collect(),
+        commit_count: preview.commit_count as u64,
+        changed_files: preview.changed_files.map(|count| count as u64),
+        conflicts_known: preview.conflicted_paths.is_some(),
+        conflicted_paths: preview.conflicted_paths.unwrap_or_default(),
+        can_fast_forward: preview.can_fast_forward,
+        up_to_date: preview.up_to_date,
+    }
+}
+
+fn preview_from_proto(response: proto::PreviewGitOperationResponse) -> GitOperationPreview {
+    GitOperationPreview {
+        commits: response
+            .commits
+            .into_iter()
+            .map(|commit| PreviewCommit {
+                sha: commit.sha.into(),
+                subject: commit.subject.into(),
+            })
+            .collect(),
+        commit_count: response.commit_count as usize,
+        changed_files: response.changed_files.map(|count| count as usize),
+        conflicted_paths: response
+            .conflicts_known
+            .then_some(response.conflicted_paths),
+        can_fast_forward: response.can_fast_forward,
+        up_to_date: response.up_to_date,
+    }
+}
+
 impl MergeDetails {
     async fn update(
         &mut self,
@@ -6292,6 +6556,9 @@ impl MergeDetails {
     ) -> bool {
         log::debug!("load merge details");
         self.message = backend.merge_message().await.map(SharedString::from);
+        let operation = backend.operation_state().await;
+        let operation_changed = self.operation != operation;
+        self.operation = operation;
         let heads = backend
             .revparse_batch(vec![
                 "MERGE_HEAD".into(),
@@ -6330,7 +6597,7 @@ impl MergeDetails {
                 keep
             });
 
-        conflicts_changed
+        conflicts_changed || operation_changed
     }
 }
 
@@ -8819,6 +9086,94 @@ impl Repository {
         )
     }
 
+    pub fn run_git_operation(
+        &mut self,
+        operation: GitOperation,
+        askpass: AskPassDelegate,
+        _cx: &mut App,
+    ) -> oneshot::Receiver<Result<GitOperationOutcome>> {
+        let askpass_delegates = self.askpass_delegates.clone();
+        let askpass_id = util::post_inc(&mut self.latest_askpass_id);
+        let id = self.id;
+        let status = operation.command_line().map(SharedString::from);
+
+        self.send_job("git operation", status, move |git_repo, cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState {
+                    backend,
+                    environment,
+                    ..
+                }) => {
+                    backend
+                        .run_operation(operation, askpass, environment.clone(), cx)
+                        .await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let _askpass_operation =
+                        RemoteAskPassOperation::new(askpass_id, askpass, askpass_delegates);
+                    let response = client
+                        .request(proto::RunGitOperation {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            askpass_id,
+                            operation: Some(git_operation_to_proto(&operation)),
+                        })
+                        .await?;
+
+                    Ok(GitOperationOutcome {
+                        stopped: response.stopped,
+                        output: RemoteCommandOutput {
+                            stdout: response.stdout,
+                            stderr: response.stderr,
+                        },
+                    })
+                }
+            }
+        })
+    }
+
+    pub fn preview_git_operation(
+        &mut self,
+        request: GitOperationPreviewRequest,
+    ) -> oneshot::Receiver<Result<GitOperationPreview>> {
+        let id = self.id;
+        self.send_job(
+            "preview git operation",
+            None,
+            move |git_repo, _| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.preview_operation(request).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        let request = match request {
+                            GitOperationPreviewRequest::Merge { source } => {
+                                proto::preview_git_operation::Request::MergeSource(source)
+                            }
+                            GitOperationPreviewRequest::CherryPick {
+                                revisions,
+                                mainline,
+                            } => proto::preview_git_operation::Request::CherryPick(
+                                proto::PreviewCherryPick {
+                                    revisions,
+                                    mainline,
+                                },
+                            ),
+                        };
+                        let response = client
+                            .request(proto::PreviewGitOperation {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                request: Some(request),
+                            })
+                            .await?;
+                        Ok(preview_from_proto(response))
+                    }
+                }
+            },
+        )
+    }
+
     fn spawn_set_index_text_job(
         &mut self,
         path: RepoPath,
@@ -9849,10 +10204,16 @@ impl Repository {
                 .into_iter()
                 .filter_map(|path| Some((RepoPath::from_proto(&path).ok()?, vec![]))),
         );
-        let conflicts_changed =
-            self.snapshot.merge.merge_heads_by_conflicted_path != new_merge_heads;
+        let new_operation = update
+            .operation_state
+            .as_ref()
+            .and_then(|state| operation_state_from_proto(state).log_err());
+        let conflicts_changed = self.snapshot.merge.merge_heads_by_conflicted_path
+            != new_merge_heads
+            || self.snapshot.merge.operation != new_operation;
         self.snapshot.merge.merge_heads_by_conflicted_path = new_merge_heads;
         self.snapshot.merge.message = update.merge_message.map(SharedString::from);
+        self.snapshot.merge.operation = new_operation;
         let new_stash_entries = GitStash {
             entries: update
                 .stash_entries
@@ -11610,6 +11971,72 @@ mod tests {
                 "regular file should have a git diff base"
             );
         });
+    }
+
+    #[test]
+    fn test_git_operation_proto_round_trip() {
+        let merge = MergeOptions {
+            fast_forward: FastForward::Never,
+            squash: true,
+            commit: false,
+            signoff: true,
+            prefer: Some(ConflictPreference::Theirs),
+            allow_unrelated_histories: true,
+            ..MergeOptions::new("feature")
+        };
+        let apply_options = ApplyCommitsOptions {
+            commit: false,
+            record_origin: true,
+            mainline: Some(2),
+            signoff: true,
+        };
+        let operations = [
+            GitOperation::Merge(MergeOptions::new("main")),
+            GitOperation::Merge(merge),
+            GitOperation::CherryPick {
+                commits: vec!["abc".into(), "HEAD..feature".into()],
+                options: apply_options.clone(),
+            },
+            GitOperation::Revert {
+                commits: vec!["def".into()],
+                options: apply_options,
+            },
+            GitOperation::Continue(GitOperationKind::Rebase),
+            GitOperation::Skip(GitOperationKind::CherryPick),
+            GitOperation::Abort(GitOperationKind::Merge),
+        ];
+        for operation in operations {
+            assert_eq!(
+                git_operation_from_proto(git_operation_to_proto(&operation)).unwrap(),
+                operation
+            );
+        }
+
+        let state = GitOperationState {
+            kind: GitOperationKind::Revert,
+            current_commit: Some("abc".into()),
+            remaining_commits: 3,
+        };
+        assert_eq!(
+            operation_state_from_proto(&operation_state_to_proto(&state)).unwrap(),
+            state
+        );
+
+        let preview = GitOperationPreview {
+            commits: vec![PreviewCommit {
+                sha: "abc".into(),
+                subject: "subject".into(),
+            }],
+            commit_count: 1,
+            changed_files: Some(2),
+            conflicted_paths: None,
+            can_fast_forward: true,
+            up_to_date: false,
+        };
+        assert_eq!(
+            preview_from_proto(preview_to_proto(preview.clone())),
+            preview
+        );
     }
 
     #[gpui::test]

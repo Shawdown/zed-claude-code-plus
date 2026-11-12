@@ -1,5 +1,10 @@
-use crate::{commit_view::CommitView, create_tag_at_commit};
+use crate::{
+    commit_view::CommitView,
+    create_tag_at_commit,
+    merge_modal::{self, MergeModalMode},
+};
 use git::Oid;
+use git::operation::{ApplyCommitsOptions, GitOperation};
 use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity, Window, actions};
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 
@@ -51,6 +56,21 @@ pub(crate) fn commit_context_menu(
         &workspace,
         cx,
     );
+    let apply_target = repository
+        .as_ref()
+        .and_then(WeakEntity::upgrade)
+        .map(|repository| {
+            let snapshot = repository.read(cx);
+            let is_head = snapshot
+                .head_commit
+                .as_ref()
+                .is_some_and(|head| head.sha.as_ref() == sha.to_string());
+            (
+                repository.clone(),
+                merge_modal::head_name(snapshot),
+                is_head,
+            )
+        });
     let header = match &ref_name {
         Some(ref_name) => format!("Ref {ref_name}"),
         None => format!("Commit {sha_short}"),
@@ -143,6 +163,69 @@ pub(crate) fn commit_context_menu(
                         })
                         .log_err();
                 }
+            })
+            .when_some(apply_target, |menu, (repository, head_name, is_head)| {
+                let apply_commits = |commit: bool| {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        merge_modal::run_git_operation(
+                            &workspace,
+                            repository.clone(),
+                            GitOperation::CherryPick {
+                                commits: vec![sha.to_string()],
+                                options: ApplyCommitsOptions {
+                                    commit,
+                                    ..ApplyCommitsOptions::default()
+                                },
+                            },
+                            window,
+                            cx,
+                        )
+                    }
+                };
+                menu.separator()
+                    .header(format!("Apply to {head_name}"))
+                    .when(!is_head, |menu| {
+                        menu.entry("Cherry-pick", None, apply_commits(true))
+                            .entry("Cherry-pick Without Committing", None, apply_commits(false))
+                            .entry("Cherry-pick With Options…", None, {
+                                let repository = repository.clone();
+                                let workspace = workspace.clone();
+                                move |window, cx| {
+                                    let repository = repository.clone();
+                                    workspace
+                                        .update(cx, |workspace, cx| {
+                                            merge_modal::open_merge_modal(
+                                                workspace,
+                                                Some(repository),
+                                                MergeModalMode::CherryPick,
+                                                Some(sha.to_string()),
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .log_err();
+                                }
+                            })
+                    })
+                    .entry("Revert Commit", None, {
+                        let repository = repository.clone();
+                        let workspace = workspace.clone();
+                        move |window, cx| {
+                            merge_modal::run_git_operation(
+                                &workspace,
+                                repository.clone(),
+                                GitOperation::Revert {
+                                    commits: vec![sha.to_string()],
+                                    options: ApplyCommitsOptions::default(),
+                                },
+                                window,
+                                cx,
+                            )
+                        }
+                    })
+                    .separator()
             })
             .when(source == CommitContextMenuSource::GitPanel, |menu| {
                 menu.entry("Show in Git Graph", None, move |window, cx| {

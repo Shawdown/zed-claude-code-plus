@@ -11,6 +11,10 @@ use git::repository::GitCommitTemplate;
 use git::{
     Oid, RunHook,
     blame::Blame,
+    operation::{
+        GitOperation, GitOperationOutcome, GitOperationPreview, GitOperationPreviewRequest,
+        GitOperationState,
+    },
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
         CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
@@ -532,6 +536,10 @@ impl GitRepository for FakeGitRepository {
     }
 
     fn merge_message(&self) -> BoxFuture<'_, Option<String>> {
+        async move { None }.boxed()
+    }
+
+    fn operation_state(&self) -> BoxFuture<'_, Option<GitOperationState>> {
         async move { None }.boxed()
     }
 
@@ -1325,6 +1333,23 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
+        unimplemented!()
+    }
+
+    fn run_operation(
+        &self,
+        _operation: GitOperation,
+        _askpass: AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<GitOperationOutcome>> {
+        unimplemented!()
+    }
+
+    fn preview_operation(
+        &self,
+        _request: GitOperationPreviewRequest,
+    ) -> BoxFuture<'_, Result<GitOperationPreview>> {
         unimplemented!()
     }
 

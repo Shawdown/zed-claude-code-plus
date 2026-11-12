@@ -7,12 +7,14 @@ use crate::{
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
     git_status_icon,
+    merge_modal::{self, MergeModalMode},
 };
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
+    operation::{FastForward, GitOperation, MergeOptions},
     parse_git_remote_url,
     repository::{InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
     status::{FileStatus, StatusCode, TrackedStatus},
@@ -64,6 +66,7 @@ use util::{ResultExt, debug_panic};
 use workspace::{
     ItemNavHistory, ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
+    notifications::DetachAndPromptErr,
 };
 
 const COMMIT_CIRCLE_RADIUS: Pixels = px(4.5);
@@ -1392,6 +1395,10 @@ struct GitGraphContextMenu {
 #[derive(Clone)]
 struct RefMenuEntry {
     ref_name: Option<SharedString>,
+    is_tag: bool,
+    is_head: bool,
+    repository: Option<Entity<Repository>>,
+    workspace: WeakEntity<Workspace>,
     git_tasks: Vec<(TaskSourceKind, ResolvedTask)>,
 }
 
@@ -1401,11 +1408,18 @@ impl RefMenuEntry {
         mut menu: ContextMenu,
         git_graph: &Entity<GitGraph>,
         window: &mut Window,
+        cx: &App,
     ) -> ContextMenu {
-        if let Some(ref_name) = self.ref_name {
-            menu = menu.entry("Copy Ref Name", None, move |_window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(ref_name.to_string()));
+        if let Some(ref_name) = self.ref_name.clone() {
+            menu = menu.entry("Copy Ref Name", None, {
+                let ref_name = ref_name.clone();
+                move |_window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(ref_name.to_string()));
+                }
             });
+            if let Some(repository) = self.repository.clone().filter(|_| !self.is_head) {
+                menu = self.add_apply_entries(menu, ref_name, repository, cx);
+            }
         }
 
         menu = menu.separator().header("Custom Commands");
@@ -1442,6 +1456,85 @@ impl RefMenuEntry {
         }
 
         menu
+    }
+
+    fn add_apply_entries(
+        &self,
+        mut menu: ContextMenu,
+        ref_name: SharedString,
+        repository: Entity<Repository>,
+        cx: &App,
+    ) -> ContextMenu {
+        let head_name = merge_modal::head_name(repository.read(cx));
+        if !self.is_tag {
+            let repository = repository.clone();
+            let ref_name = ref_name.clone();
+            menu = menu.entry("Switch to Branch", None, move |window, cx| {
+                let receiver = repository.update(cx, |repository, _| {
+                    repository.change_branch(ref_name.to_string())
+                });
+                cx.spawn(async move |_| receiver.await?)
+                    .detach_and_prompt_err("Failed to switch branch", window, cx, |_, _, _| None);
+            });
+        }
+
+        let merge = |configure: fn(&mut MergeOptions)| {
+            let repository = repository.clone();
+            let workspace = self.workspace.clone();
+            let ref_name = ref_name.clone();
+            move |window: &mut Window, cx: &mut App| {
+                let mut options = MergeOptions::new(ref_name.to_string());
+                configure(&mut options);
+                merge_modal::run_git_operation(
+                    &workspace,
+                    repository.clone(),
+                    GitOperation::Merge(options),
+                    window,
+                    cx,
+                );
+            }
+        };
+        let open_modal = |mode: MergeModalMode, source: String| {
+            let repository = repository.clone();
+            let workspace = self.workspace.clone();
+            move |window: &mut Window, cx: &mut App| {
+                let repository = repository.clone();
+                let source = source.clone();
+                workspace
+                    .update(cx, |workspace, cx| {
+                        merge_modal::open_merge_modal(
+                            workspace,
+                            Some(repository),
+                            mode,
+                            Some(source),
+                            window,
+                            cx,
+                        )
+                    })
+                    .log_err();
+            }
+        };
+
+        menu.separator()
+            .header(format!("Into {head_name}"))
+            .entry("Merge", None, merge(|_| {}))
+            .entry("Squash Merge", None, merge(|options| options.squash = true))
+            .entry(
+                "Fast-forward Only",
+                None,
+                merge(|options| options.fast_forward = FastForward::Only),
+            )
+            .entry(
+                "Merge With Options…",
+                None,
+                open_modal(MergeModalMode::Merge, ref_name.to_string()),
+            )
+            .entry(
+                format!("Cherry-pick Commits Not on {head_name}…"),
+                None,
+                open_modal(MergeModalMode::CherryPick, format!("HEAD..{ref_name}")),
+            )
+            .separator()
     }
 }
 
@@ -2661,9 +2754,9 @@ impl GitGraph {
 
         let ref_entry = self.ref_menu_entry(commit.data.sha, &name, cx);
         let git_graph = cx.entity();
-        let context_menu = ContextMenu::build(window, cx, move |menu, window, _| {
+        let context_menu = ContextMenu::build(window, cx, move |menu, window, cx| {
             menu.header(format!("Ref {name}"))
-                .map(|menu| ref_entry.add_entries(menu, &git_graph, window))
+                .map(|menu| ref_entry.add_entries(menu, &git_graph, window, cx))
         });
 
         self.set_context_menu(context_menu, position, Some(index), window, cx);
@@ -2694,8 +2787,10 @@ impl GitGraph {
             menu = menu.header("Refs");
             for (ref_entry, name) in ref_entries {
                 let git_graph = git_graph.clone();
-                menu = menu.submenu(name, move |submenu, window, _cx| {
-                    ref_entry.clone().add_entries(submenu, &git_graph, window)
+                menu = menu.submenu(name, move |submenu, window, cx| {
+                    ref_entry
+                        .clone()
+                        .add_entries(submenu, &git_graph, window, cx)
                 });
             }
             menu
@@ -2709,16 +2804,31 @@ impl GitGraph {
     /// same entries can be rendered both as a standalone menu and as a submenu.
     fn ref_menu_entry(&self, sha: Oid, name: &SharedString, cx: &App) -> RefMenuEntry {
         let ref_name = Self::ref_name_from_decoration(name);
-        let repository = self
-            .get_repository(cx)
-            .map(|repository| repository.downgrade());
+        let repository = self.get_repository(cx);
+        let is_head = name.starts_with("HEAD -> ")
+            || repository.as_ref().is_some_and(|repository| {
+                repository
+                    .read(cx)
+                    .branch
+                    .as_ref()
+                    .is_some_and(|branch| Some(branch.name()) == ref_name.as_deref())
+            });
         let git_tasks = git_context_menu_tasks(
-            git_task_context(&repository, sha, ref_name.as_deref(), cx),
+            git_task_context(
+                &repository.as_ref().map(Entity::downgrade),
+                sha,
+                ref_name.as_deref(),
+                cx,
+            ),
             &self.workspace,
             cx,
         );
         RefMenuEntry {
             ref_name,
+            is_tag: name.starts_with("tag: "),
+            is_head,
+            repository,
+            workspace: self.workspace.clone(),
             git_tasks,
         }
     }

@@ -146,6 +146,20 @@ message UpdateRepository {
   optional string repository_dir_abs_path = 19;
   optional string common_dir_abs_path = 20;
   optional string branch_list_error = 21;
+  optional GitOperationState operation_state = 22;
+}
+
+message GitOperationState {
+  enum Kind {
+    Merge = 0;
+    CherryPick = 1;
+    Revert = 2;
+    Rebase = 3;
+  }
+
+  Kind kind = 1;
+  optional string current_commit = 2;
+  uint64 remaining_commits = 3;
 }
 
 message RemoveRepository {
@@ -797,4 +811,82 @@ message SearchCommits {
 
 message SearchCommitsResponse {
   repeated string shas = 1;
+}
+
+message RunGitOperation {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  uint64 askpass_id = 3;
+  oneof operation {
+    MergeOperation merge = 4;
+    ApplyCommitsOperation cherry_pick = 5;
+    ApplyCommitsOperation revert = 6;
+    GitOperationState.Kind continue_operation = 7;
+    GitOperationState.Kind skip_operation = 8;
+    GitOperationState.Kind abort_operation = 9;
+  }
+}
+
+message MergeOperation {
+  enum FastForward {
+    Auto = 0;
+    Only = 1;
+    Never = 2;
+  }
+
+  enum ConflictPreference {
+    Ours = 0;
+    Theirs = 1;
+  }
+
+  string source = 1;
+  FastForward fast_forward = 2;
+  bool squash = 3;
+  bool commit = 4;
+  bool signoff = 5;
+  optional ConflictPreference prefer = 6;
+  bool allow_unrelated_histories = 7;
+}
+
+message ApplyCommitsOperation {
+  repeated string commits = 1;
+  bool commit = 2;
+  bool record_origin = 3;
+  optional uint32 mainline = 4;
+  bool signoff = 5;
+}
+
+message RunGitOperationResponse {
+  bool stopped = 1;
+  string stdout = 2;
+  string stderr = 3;
+}
+
+message PreviewGitOperation {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  oneof request {
+    string merge_source = 3;
+    PreviewCherryPick cherry_pick = 4;
+  }
+}
+
+message PreviewCherryPick {
+  repeated string revisions = 1;
+  optional uint32 mainline = 2;
+}
+
+message PreviewGitOperationResponse {
+  repeated PreviewCommit commits = 1;
+  uint64 commit_count = 2;
+  optional uint64 changed_files = 3;
+  bool conflicts_known = 4;
+  repeated string conflicted_paths = 5;
+  bool can_fast_forward = 6;
+  bool up_to_date = 7;
+}
+
+message PreviewCommit {
+  string sha = 1;
+  string subject = 2;
 }

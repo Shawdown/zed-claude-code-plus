@@ -517,7 +517,11 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
-    GetTerminalShellResponse get_terminal_shell_response = 495; // current max
+    GetTerminalShellResponse get_terminal_shell_response = 495;
+    RunGitOperation run_git_operation = 496;
+    RunGitOperationResponse run_git_operation_response = 497;
+    PreviewGitOperation preview_git_operation = 498;
+    PreviewGitOperationResponse preview_git_operation_response = 499; // current max
   }
 
   reserved 87 to 88;

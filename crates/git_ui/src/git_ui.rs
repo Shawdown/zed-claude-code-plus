@@ -49,6 +49,7 @@ pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
+mod merge_modal;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
@@ -250,6 +251,44 @@ pub fn init(cx: &mut App) {
                 });
             });
         }
+        workspace.register_action(|workspace, _: &git::Merge, window, cx| {
+            merge_modal::open_merge_modal(
+                workspace,
+                None,
+                merge_modal::MergeModalMode::Merge,
+                None,
+                window,
+                cx,
+            );
+        });
+        workspace.register_action(|workspace, _: &git::CherryPick, window, cx| {
+            merge_modal::open_merge_modal(
+                workspace,
+                None,
+                merge_modal::MergeModalMode::CherryPick,
+                None,
+                window,
+                cx,
+            );
+        });
+        workspace.register_action(|workspace, _: &git::ContinueOperation, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| panel.continue_operation(window, cx));
+        });
+        workspace.register_action(|workspace, _: &git::SkipCommit, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| panel.skip_operation_commit(window, cx));
+        });
+        workspace.register_action(|workspace, _: &git::AbortOperation, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| panel.abort_operation(window, cx));
+        });
         workspace.register_action(|workspace, action: &git::StashAll, window, cx| {
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;

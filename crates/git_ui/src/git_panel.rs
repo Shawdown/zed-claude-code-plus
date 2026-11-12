@@ -30,6 +30,7 @@ use futures::StreamExt as _;
 use futures::channel::oneshot::Canceled;
 use git::Oid;
 use git::commit::ParsedCommitMessage;
+use git::operation::{GitOperation, GitOperationKind, GitOperationState};
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
     GitCommitTemplate, GitCommitter, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
@@ -4059,6 +4060,37 @@ impl GitPanel {
             return;
         }
 
+        let operation_state = if options.amend {
+            None
+        } else {
+            self.operation_state(cx)
+        };
+        let has_changes = self.has_staged_changes() || self.has_tracked_changes();
+        if let Some(state) = &operation_state
+            && state.kind != GitOperationKind::Merge
+            && !has_changes
+        {
+            self.run_git_operation(
+                active_repository,
+                GitOperation::Continue(state.kind),
+                window,
+                cx,
+            );
+            return;
+        }
+        let in_merge = operation_state
+            .as_ref()
+            .is_some_and(|state| state.kind == GitOperationKind::Merge);
+        // Committing a stopped commit by hand leaves the sequencer waiting for the rest.
+        let continue_after_commit = operation_state.and_then(|state| match state.kind {
+            GitOperationKind::Merge => None,
+            GitOperationKind::Rebase => Some(state.kind),
+            GitOperationKind::CherryPick | GitOperationKind::Revert => {
+                (state.remaining_commits > 0).then_some(state.kind)
+            }
+        });
+        let operation_repository = active_repository.clone();
+
         let askpass = self.askpass_delegate("git commit", window, cx);
         let commit_message = self.custom_or_suggested_commit_message(window, cx);
 
@@ -4087,7 +4119,7 @@ impl GitPanel {
                 .map(|status_entry| status_entry.repo_path.clone())
                 .collect::<Vec<_>>();
 
-            if changed_files.is_empty() && !options.amend {
+            if changed_files.is_empty() && !options.amend && !in_merge {
                 error_spawn("No changes to commit", window, cx);
                 return;
             }
@@ -4117,6 +4149,14 @@ impl GitPanel {
                                 .update(cx, |editor, cx| editor.clear(window, cx));
                             this.original_commit_message = None;
                             this.serialize(cx);
+                        }
+                        if let Some(kind) = continue_after_commit {
+                            this.run_git_operation(
+                                operation_repository,
+                                GitOperation::Continue(kind),
+                                window,
+                                cx,
+                            );
                         }
                     }
                     Err(e) => this.show_error_toast("commit", e, cx),
@@ -4866,6 +4906,229 @@ impl GitPanel {
             .ok();
         })
         .detach();
+    }
+
+    pub(crate) fn operation_state(&self, cx: &App) -> Option<GitOperationState> {
+        self.active_repository
+            .as_ref()?
+            .read(cx)
+            .merge
+            .operation
+            .clone()
+    }
+
+    pub(crate) fn run_git_operation(
+        &mut self,
+        repository: Entity<Repository>,
+        operation: GitOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subcommand = operation.kind().subcommand();
+        let command_line = match operation.args() {
+            Ok(args) => format!("git {}", args.join(" ")),
+            Err(error) => {
+                self.show_error_toast(subcommand, error, cx);
+                return;
+            }
+        };
+        let askpass = self.askpass_delegate(command_line, window, cx);
+        let run = repository.update(cx, |repository, cx| {
+            repository.run_git_operation(operation.clone(), askpass, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = run.await.unwrap_or_else(|canceled| Err(canceled.into()));
+            this.update(cx, |this, cx| match result {
+                Ok(outcome) => this.show_remote_output(
+                    RemoteAction::Operation {
+                        operation,
+                        stopped: outcome.stopped,
+                    },
+                    outcome.output,
+                    cx,
+                ),
+                Err(error) => this.show_error_toast(subcommand, error, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn continue_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation_state(cx).is_none() {
+            return;
+        }
+        let options = CommitOptions {
+            amend: false,
+            ..self.commit_options()
+        };
+        self.commit_changes(options, window, cx);
+    }
+
+    pub(crate) fn skip_operation_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let Some(state) = self.operation_state(cx) else {
+            return;
+        };
+        if state.kind.can_skip() {
+            self.run_git_operation(repository, GitOperation::Skip(state.kind), window, cx);
+        }
+    }
+
+    pub(crate) fn abort_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let Some(state) = self.operation_state(cx) else {
+            return;
+        };
+        let label = state.kind.label();
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!("Abort the {}?", label.to_lowercase()),
+            Some("The branch returns to where it was before. Conflict resolutions are lost."),
+            &[&format!("Abort {label}"), "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if prompt.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.run_git_operation(repository, GitOperation::Abort(state.kind), window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn resolve_operation_conflicts_with_agent(&self, window: &mut Window, cx: &mut App) {
+        let conflicted_file_paths =
+            crate::conflict_view::collect_conflicted_file_paths(self.project.read(cx), cx);
+        if conflicted_file_paths.is_empty() {
+            return;
+        }
+        window.dispatch_action(
+            Box::new(zed_actions::agent::ResolveConflictedFilesWithAgent {
+                conflicted_file_paths,
+            }),
+            cx,
+        );
+    }
+
+    fn render_operation_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let state = self.operation_state(cx)?;
+        let kind = state.kind;
+        let conflict_count = self
+            .change_entries_by_path()
+            .filter(|entry| entry.status.is_conflicted())
+            .count();
+
+        let mut details = Vec::new();
+        if let Some(commit) = &state.current_commit {
+            details.push(commit.chars().take(7).collect::<String>());
+        }
+        if state.remaining_commits > 0 {
+            details.push(format!("{} more", state.remaining_commits));
+        }
+        if conflict_count > 0 {
+            details.push(format!(
+                "{conflict_count} conflict{}",
+                if conflict_count == 1 { "" } else { "s" }
+            ));
+        }
+        let can_skip = kind.can_skip() && state.current_commit.is_some();
+        let can_resolve_with_agent =
+            conflict_count > 0 && AgentSettings::get_global(cx).enabled(cx);
+
+        Some(
+            v_flex()
+                .px_2()
+                .py_1p5()
+                .gap_1()
+                .border_t_1()
+                .border_color(cx.theme().status().info_border)
+                .bg(cx.theme().status().info_background.opacity(0.5))
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .min_w_0()
+                        .child(
+                            Icon::new(if conflict_count > 0 {
+                                IconName::GitMergeConflict
+                            } else {
+                                IconName::GitBranch
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Info),
+                        )
+                        .child(
+                            Label::new(format!("{} in progress", kind.label()))
+                                .size(LabelSize::Small),
+                        )
+                        .when(!details.is_empty(), |row| {
+                            row.child(
+                                Label::new(details.join(" · "))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .justify_end()
+                        .when(can_resolve_with_agent, |row| {
+                            row.child(
+                                Button::new("operation-resolve-with-agent", "Resolve With Agent")
+                                    .label_size(LabelSize::Small)
+                                    .layer(ElevationIndex::ModalSurface)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.resolve_operation_conflicts_with_agent(window, cx)
+                                    })),
+                            )
+                        })
+                        .when(can_skip, |row| {
+                            row.child(
+                                Button::new("operation-skip", "Skip Commit")
+                                    .label_size(LabelSize::Small)
+                                    .layer(ElevationIndex::ModalSurface)
+                                    .tooltip(Tooltip::text(format!(
+                                        "git {} --skip",
+                                        kind.subcommand()
+                                    )))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.skip_operation_commit(window, cx)
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("operation-abort", "Abort")
+                                .label_size(LabelSize::Small)
+                                .layer(ElevationIndex::ModalSurface)
+                                .tooltip(Tooltip::text(format!(
+                                    "git {} --abort",
+                                    kind.subcommand()
+                                )))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.abort_operation(window, cx)
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    /// The operation the commit button continues without committing, when there's nothing to commit.
+    fn continues_without_commit(&self, cx: &App) -> Option<GitOperationKind> {
+        if self.amend_pending || self.has_staged_changes() || self.has_tracked_changes() {
+            return None;
+        }
+        self.operation_state(cx)
+            .map(|state| state.kind)
+            .filter(|kind| *kind != GitOperationKind::Merge)
     }
 
     pub(crate) fn pull(&mut self, rebase: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -6725,20 +6988,34 @@ impl GitPanel {
             (false, "Generating commit message...")
         } else if self.has_unstaged_conflicts() {
             (false, "You must resolve conflicts before committing")
-        } else if !self.has_staged_changes() && !self.has_tracked_changes() && !self.amend_pending {
+        } else if !self.has_staged_changes()
+            && !self.has_tracked_changes()
+            && !self.amend_pending
+            && self.operation_state(cx).is_none()
+        {
             (false, "No changes to commit")
         } else if self.pending_commit.is_some() {
             (false, "Commit in progress")
-        } else if !self.has_commit_message(cx) {
+        } else if !self.has_commit_message(cx) && self.continues_without_commit(cx).is_none() {
             (false, "No commit message")
         } else if !self.has_write_access(cx) {
             (false, "You do not have write access to this project")
         } else {
-            (true, self.commit_button_title())
+            (true, self.commit_button_title(cx))
         }
     }
 
-    pub fn commit_button_title(&self) -> &'static str {
+    pub fn commit_button_title(&self, cx: &App) -> &'static str {
+        if !self.amend_pending
+            && let Some(state) = self.operation_state(cx)
+        {
+            return match state.kind {
+                GitOperationKind::Merge => "Commit Merge",
+                GitOperationKind::CherryPick
+                | GitOperationKind::Revert
+                | GitOperationKind::Rebase => "Continue",
+            };
+        }
         if self.amend_pending {
             if self.has_staged_changes() {
                 "Amend"
@@ -7104,6 +7381,7 @@ impl GitPanel {
                 head_commit,
                 Some(git_panel),
             ))
+            .children(self.render_operation_banner(cx))
             .when(title_exceeds_limit, |this| {
                 this.child(
                     h_flex()
@@ -7195,12 +7473,15 @@ impl GitPanel {
 
     fn render_commit_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (can_commit, tooltip) = self.configure_commit_button(cx);
-        let title = self.commit_button_title();
+        let title = self.commit_button_title(cx);
         let commit_tooltip_focus_handle = self.commit_editor.focus_handle(cx);
         let options = self.commit_options();
         let amend = options.amend;
         let signoff = options.signoff;
         let no_verify = options.no_verify;
+        let continue_command = self
+            .continues_without_commit(cx)
+            .map(|kind| format!("git {} --continue", kind.subcommand()));
 
         let label_color = if self.pending_commit.is_some() {
             Color::Disabled
@@ -7245,12 +7526,14 @@ impl GitPanel {
                                 Tooltip::with_meta_in(
                                     tooltip,
                                     Some(&git::Commit),
-                                    format!(
-                                        "git commit{}{}{}",
-                                        if amend { " --amend" } else { "" },
-                                        if signoff { " --signoff" } else { "" },
-                                        if no_verify { " --no-verify" } else { "" }
-                                    ),
+                                    continue_command.clone().unwrap_or_else(|| {
+                                        format!(
+                                            "git commit{}{}{}",
+                                            if amend { " --amend" } else { "" },
+                                            if signoff { " --signoff" } else { "" },
+                                            if no_verify { " --no-verify" } else { "" }
+                                        )
+                                    }),
                                     &handle.clone(),
                                     cx,
                                 )

@@ -454,7 +454,7 @@ fn render_conflict_buttons(
         .into_any()
 }
 
-fn collect_conflicted_file_paths(project: &Project, cx: &App) -> Vec<String> {
+pub(crate) fn collect_conflicted_file_paths(project: &Project, cx: &App) -> Vec<String> {
     let git_store = project.git_store().read(cx);
     let mut paths = Vec::new();
 

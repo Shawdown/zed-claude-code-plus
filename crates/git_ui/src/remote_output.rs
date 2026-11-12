@@ -1,6 +1,9 @@
 use anyhow::Context as _;
 
-use git::repository::{Remote, RemoteCommandOutput};
+use git::{
+    operation::GitOperation,
+    repository::{Remote, RemoteCommandOutput},
+};
 use ui::SharedString;
 use util::ResultExt as _;
 
@@ -20,6 +23,11 @@ pub enum RemoteAction {
     Fetch(Option<Remote>),
     Pull(Remote),
     Push(SharedString, Remote),
+    Operation {
+        operation: GitOperation,
+        /// The operation paused, usually on conflicts.
+        stopped: bool,
+    },
 }
 
 impl RemoteAction {
@@ -28,6 +36,7 @@ impl RemoteAction {
             RemoteAction::Fetch(_) => "fetch",
             RemoteAction::Pull(_) => "pull",
             RemoteAction::Push(_, _) => "push",
+            RemoteAction::Operation { operation, .. } => operation.kind().subcommand(),
         }
     }
 }
@@ -81,6 +90,9 @@ fn extract_url(line: &str) -> Option<String> {
 
 pub fn format_output(action: &RemoteAction, output: RemoteCommandOutput) -> SuccessMessage {
     match action {
+        RemoteAction::Operation { operation, stopped } => {
+            format_operation_output(operation, *stopped, output)
+        }
         RemoteAction::Fetch(remote) => {
             if output.stderr.is_empty() {
                 SuccessMessage {
@@ -185,10 +197,150 @@ pub fn format_output(action: &RemoteAction, output: RemoteCommandOutput) -> Succ
     }
 }
 
+fn describe_commits(commits: &[String]) -> String {
+    match commits {
+        [commit] if !commit.contains("..") => commit.chars().take(7).collect(),
+        _ if commits.iter().any(|commit| commit.contains("..")) => "commits".into(),
+        _ => format!("{} commits", commits.len()),
+    }
+}
+
+fn format_operation_output(
+    operation: &GitOperation,
+    stopped: bool,
+    output: RemoteCommandOutput,
+) -> SuccessMessage {
+    let label = operation.kind().label();
+    let message = if stopped {
+        format!("{label} paused: resolve conflicts, then continue")
+    } else {
+        match operation {
+            GitOperation::Merge(options) => {
+                if output.stdout.contains("Already up to date") {
+                    return SuccessMessage {
+                        message: "Merge: Already up to date".into(),
+                        style: SuccessStyle::Toast,
+                    };
+                } else if options.squash {
+                    format!("Squashed {}: review and commit", options.source)
+                } else if output.stdout.starts_with("Updating") {
+                    format!("Fast-forwarded to {}", options.source)
+                } else if !options.commit {
+                    format!("Merged {}: review and commit", options.source)
+                } else {
+                    format!("Merged {}", options.source)
+                }
+            }
+            GitOperation::CherryPick { commits, options } => {
+                if options.commit {
+                    format!("Cherry-picked {}", describe_commits(commits))
+                } else {
+                    format!("Applied {}: review and commit", describe_commits(commits))
+                }
+            }
+            GitOperation::Revert { commits, options } => {
+                if options.commit {
+                    format!("Reverted {}", describe_commits(commits))
+                } else {
+                    format!("Reverted {}: review and commit", describe_commits(commits))
+                }
+            }
+            GitOperation::Continue(_) => format!("{label} completed"),
+            GitOperation::Skip(_) => "Skipped commit".into(),
+            GitOperation::Abort(_) => format!("{label} aborted"),
+        }
+    };
+    SuccessMessage {
+        message,
+        style: SuccessStyle::ToastWithLog { output },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git::operation::{ApplyCommitsOptions, GitOperationKind, MergeOptions};
     use indoc::indoc;
+
+    #[test]
+    fn test_operation_messages() {
+        let message = |operation: GitOperation, stopped: bool, stdout: &str| {
+            format_output(
+                &RemoteAction::Operation { operation, stopped },
+                RemoteCommandOutput {
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                },
+            )
+            .message
+        };
+        let merge = |configure: fn(&mut MergeOptions)| {
+            let mut options = MergeOptions::new("feature");
+            configure(&mut options);
+            GitOperation::Merge(options)
+        };
+        let cherry_pick = |commits: &[&str], commit: bool| GitOperation::CherryPick {
+            commits: commits.iter().map(ToString::to_string).collect(),
+            options: ApplyCommitsOptions {
+                commit,
+                ..ApplyCommitsOptions::default()
+            },
+        };
+
+        let up_to_date = format_output(
+            &RemoteAction::Operation {
+                operation: merge(|_| {}),
+                stopped: false,
+            },
+            RemoteCommandOutput {
+                stdout: "Already up to date.\n".into(),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(up_to_date.message, "Merge: Already up to date");
+        assert!(matches!(up_to_date.style, SuccessStyle::Toast));
+
+        assert_eq!(
+            message(merge(|_| {}), false, "Updating abc..def\nFast-forward\n"),
+            "Fast-forwarded to feature"
+        );
+        assert_eq!(
+            message(merge(|_| {}), false, "Merge made by the 'ort' strategy.\n"),
+            "Merged feature"
+        );
+        assert_eq!(
+            message(merge(|options| options.commit = false), false, ""),
+            "Merged feature: review and commit"
+        );
+        assert_eq!(
+            message(
+                merge(|options| options.squash = true),
+                false,
+                "Updating abc..def\nSquash commit -- not updating HEAD\n"
+            ),
+            "Squashed feature: review and commit"
+        );
+        assert_eq!(
+            message(merge(|_| {}), true, "CONFLICT (content)"),
+            "Merge paused: resolve conflicts, then continue"
+        );
+        assert_eq!(
+            message(cherry_pick(&["0123456789abcdef"], true), false, ""),
+            "Cherry-picked 0123456"
+        );
+        assert_eq!(
+            message(cherry_pick(&["abc", "def"], false), false, ""),
+            "Applied 2 commits: review and commit"
+        );
+        assert_eq!(
+            message(cherry_pick(&["HEAD..feature"], true), false, ""),
+            "Cherry-picked commits"
+        );
+        assert_eq!(
+            message(GitOperation::Abort(GitOperationKind::CherryPick), false, ""),
+            "Cherry-pick aborted"
+        );
+    }
 
     #[test]
     fn test_push_new_branch_pull_request() {

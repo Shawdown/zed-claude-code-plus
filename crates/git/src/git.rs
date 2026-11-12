@@ -1,6 +1,7 @@
 pub mod blame;
 pub mod commit;
 mod hosting_provider;
+pub mod operation;
 mod remote;
 pub mod repository;
 pub mod stash;
@@ -147,6 +148,16 @@ actions!(
         CopyBranchName,
         /// Creates a tag at HEAD.
         CreateTagAtHead,
+        /// Merges a branch or commit into the current branch.
+        Merge,
+        /// Cherry-picks commits onto the current branch.
+        CherryPick,
+        /// Continues the paused merge, cherry-pick, revert or rebase.
+        ContinueOperation,
+        /// Skips the commit the paused cherry-pick, revert or rebase stopped on.
+        SkipCommit,
+        /// Aborts the paused merge, cherry-pick, revert or rebase.
+        AbortOperation,
     ]
 );
 

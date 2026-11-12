@@ -1,4 +1,8 @@
 use crate::commit::{CommitDiffObject, CommitDiffObjectKind, parse_git_diff_raw};
+use crate::operation::{
+    GitOperation, GitOperationOutcome, GitOperationPreview, GitOperationPreviewRequest,
+    GitOperationState, PreviewCommit, parse_merge_tree_output, validate_revision,
+};
 use crate::stash::GitStash;
 use crate::status::{
     DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus,
@@ -491,7 +495,7 @@ impl UpstreamTracking {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteCommandOutput {
     pub stdout: String,
     pub stderr: String,
@@ -500,6 +504,13 @@ pub struct RemoteCommandOutput {
 impl RemoteCommandOutput {
     pub fn is_empty(&self) -> bool {
         self.stdout.is_empty() && self.stderr.is_empty()
+    }
+
+    fn from_output(output: &Output) -> Self {
+        Self {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }
     }
 }
 
@@ -842,6 +853,8 @@ pub trait GitRepository: Send + Sync {
 
     fn merge_message(&self) -> BoxFuture<'_, Option<String>>;
 
+    fn operation_state(&self) -> BoxFuture<'_, Option<GitOperationState>>;
+
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>>;
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>>;
 
@@ -1049,6 +1062,20 @@ pub trait GitRepository: Send + Sync {
         // otherwise git-credentials-manager won't work.
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<RemoteCommandOutput>>;
+
+    fn run_operation(
+        &self,
+        operation: GitOperation,
+        askpass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        // Signing commits may prompt through the askpass helper, which must run on the main thread.
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<GitOperationOutcome>>;
+
+    fn preview_operation(
+        &self,
+        request: GitOperationPreviewRequest,
+    ) -> BoxFuture<'_, Result<GitOperationPreview>>;
 
     fn get_push_remote(&self, branch: String) -> BoxFuture<'_, Result<Option<Remote>>>;
 
@@ -1879,9 +1906,20 @@ impl GitRepository for RealGitRepository {
     }
 
     fn merge_message(&self) -> BoxFuture<'_, Option<String>> {
-        let path = self.path().join("MERGE_MSG");
+        let git_dir = self.path();
         self.executor
-            .spawn(async move { std::fs::read_to_string(&path).ok() })
+            .spawn(async move {
+                std::fs::read_to_string(git_dir.join("MERGE_MSG"))
+                    .or_else(|_| std::fs::read_to_string(git_dir.join("SQUASH_MSG")))
+                    .ok()
+            })
+            .boxed()
+    }
+
+    fn operation_state(&self) -> BoxFuture<'_, Option<GitOperationState>> {
+        let git_dir = self.path();
+        self.executor
+            .spawn(async move { GitOperationState::detect(&git_dir) })
             .boxed()
     }
 
@@ -2965,6 +3003,72 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn run_operation(
+        &self,
+        operation: GitOperation,
+        ask_pass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<GitOperationOutcome>> {
+        let git = self.git_binary_in_worktree();
+        let git_dir = self.path();
+        let executor = cx.background_executor().clone();
+        // Note: Do not spawn this command on the background thread, it might pop open the credential helper
+        // which we want to block on.
+        async move {
+            let git = git?;
+            let args = operation.args()?;
+            let state_before = GitOperationState::detect(&git_dir);
+            let mut command = git.build_command(&args);
+            command
+                .envs(env.iter())
+                // `--continue` would otherwise open an editor for the commit message.
+                .env("GIT_EDITOR", "true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            let output = run_git_command_output(env, ask_pass, command, executor).await?;
+            let succeeded = output.status.success();
+            let output = RemoteCommandOutput::from_output(&output);
+            if succeeded {
+                return Ok(GitOperationOutcome {
+                    stopped: false,
+                    output,
+                });
+            }
+            let state_after = GitOperationState::detect(&git_dir);
+            if state_after.is_some() && state_after != state_before {
+                return Ok(GitOperationOutcome {
+                    stopped: true,
+                    output,
+                });
+            }
+            bail!("{}{}", output.stdout, output.stderr)
+        }
+        .boxed()
+    }
+
+    fn preview_operation(
+        &self,
+        request: GitOperationPreviewRequest,
+    ) -> BoxFuture<'_, Result<GitOperationPreview>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                match request {
+                    GitOperationPreviewRequest::Merge { source } => {
+                        preview_merge(&git, &source).await
+                    }
+                    GitOperationPreviewRequest::CherryPick {
+                        revisions,
+                        mainline,
+                    } => preview_cherry_pick(&git, &revisions, mainline).await,
+                }
+            })
+            .boxed()
+    }
+
     fn get_push_remote(&self, branch: String) -> BoxFuture<'_, Result<Option<Remote>>> {
         let git = self.git_binary();
         self.executor
@@ -3845,21 +3949,28 @@ struct GitBinaryCommandError {
 async fn run_git_command(
     env: Arc<HashMap<String, String>>,
     ask_pass: AskPassDelegate,
-    mut command: util::command::Command,
+    command: util::command::Command,
     executor: BackgroundExecutor,
 ) -> Result<RemoteCommandOutput> {
+    let output = run_git_command_output(env, ask_pass, command, executor).await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(RemoteCommandOutput::from_output(&output))
+}
+
+/// Like `run_git_command`, but returns the output of failed commands too.
+async fn run_git_command_output(
+    env: Arc<HashMap<String, String>>,
+    ask_pass: AskPassDelegate,
+    mut command: util::command::Command,
+    executor: BackgroundExecutor,
+) -> Result<Output> {
     if env.contains_key("GIT_ASKPASS") {
         let git_process = command.spawn()?;
-        let output = git_process.output().await?;
-        anyhow::ensure!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(RemoteCommandOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        })
+        Ok(git_process.output().await?)
     } else {
         let ask_pass = AskPassSession::new(executor, ask_pass).await?;
         command
@@ -3887,7 +3998,7 @@ async fn run_git_command(
 async fn run_askpass_command(
     mut ask_pass: AskPassSession,
     git_process: util::command::Child,
-) -> anyhow::Result<RemoteCommandOutput> {
+) -> anyhow::Result<Output> {
     select_biased! {
         // Git can legitimately run long without prompting (e.g. large fetches,
         // hooks), so completion is determined by the process itself.
@@ -3903,18 +4014,137 @@ async fn run_askpass_command(
             }
         }
         output = git_process.output().fuse() => {
-            let output = output?;
-            anyhow::ensure!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            Ok(RemoteCommandOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            })
+            Ok(output?)
         }
     }
+}
+
+async fn preview_merge(git: &GitBinary, source: &str) -> Result<GitOperationPreview> {
+    validate_revision(source)?;
+    let source_commit = git
+        .run(&["rev-parse", "--verify", &format!("{source}^{{commit}}")])
+        .await?;
+    let commit_count = git
+        .run(&["rev-list", "--count", &format!("HEAD..{source_commit}")])
+        .await?
+        .trim()
+        .parse()?;
+    let can_fast_forward = git
+        .build_command(&["merge-base", "--is-ancestor", "HEAD", &source_commit])
+        .output()
+        .await?
+        .status
+        .success();
+    let merge_tree = run_merge_tree(
+        git,
+        &[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "HEAD",
+            &source_commit,
+        ],
+    )
+    .await;
+    let (changed_files, conflicted_paths) = match merge_tree {
+        Some((tree, conflicts)) => (count_changed_files(git, &tree).await, Some(conflicts)),
+        None => (None, None),
+    };
+    Ok(GitOperationPreview {
+        commits: Vec::new(),
+        commit_count,
+        changed_files,
+        conflicted_paths,
+        can_fast_forward,
+        up_to_date: commit_count == 0,
+    })
+}
+
+async fn preview_cherry_pick(
+    git: &GitBinary,
+    revisions: &[String],
+    mainline: Option<u32>,
+) -> Result<GitOperationPreview> {
+    let mut commits = Vec::new();
+    for revision in revisions {
+        validate_revision(revision)?;
+        let format = "--format=%H%x00%s";
+        let output = if revision.contains("..") {
+            git.run(&["log", "--reverse", format, revision]).await?
+        } else {
+            git.run(&["log", "-1", format, &format!("{revision}^{{commit}}")])
+                .await?
+        };
+        commits.extend(output.lines().filter_map(|line| {
+            let (sha, subject) = line.split_once('\0')?;
+            Some(PreviewCommit {
+                sha: sha.to_string().into(),
+                subject: subject.to_string().into(),
+            })
+        }));
+    }
+
+    // Each commit is applied onto the tree the previous one produced, as the sequencer would.
+    let mut current_tree = "HEAD".to_string();
+    let mut conflicted_paths = Some(Vec::<String>::new());
+    for commit in &commits {
+        let merge_base = format!("--merge-base={}^{}", commit.sha, mainline.unwrap_or(1));
+        let merge_tree = run_merge_tree(
+            git,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                &merge_base,
+                &current_tree,
+                &commit.sha,
+            ],
+        )
+        .await;
+        let (Some((tree, conflicts)), Some(paths)) = (merge_tree, conflicted_paths.as_mut()) else {
+            conflicted_paths = None;
+            break;
+        };
+        for conflict in conflicts {
+            if !paths.contains(&conflict) {
+                paths.push(conflict);
+            }
+        }
+        current_tree = tree;
+    }
+    let changed_files = if conflicted_paths.is_some() && !commits.is_empty() {
+        count_changed_files(git, &current_tree).await
+    } else {
+        None
+    };
+
+    Ok(GitOperationPreview {
+        commit_count: commits.len(),
+        commits,
+        changed_files,
+        conflicted_paths,
+        can_fast_forward: false,
+        up_to_date: false,
+    })
+}
+
+/// Returns `None` when this git can't run the merge (merge-tree needs git 2.38, trees as input need 2.40).
+async fn run_merge_tree(git: &GitBinary, args: &[&str]) -> Option<(String, Vec<String>)> {
+    let output = git.build_command(args).output().await.log_err()?;
+    match output.status.code() {
+        Some(0 | 1) => parse_merge_tree_output(&String::from_utf8_lossy(&output.stdout)),
+        _ => None,
+    }
+}
+
+async fn count_changed_files(git: &GitBinary, tree: &str) -> Option<usize> {
+    let output = git
+        .run(&["diff-tree", "-r", "--name-only", "HEAD", tree])
+        .await
+        .log_err()?;
+    Some(output.lines().filter(|line| !line.is_empty()).count())
 }
 
 #[derive(Clone, Ord, Hash, PartialOrd, Eq, PartialEq)]
@@ -4104,6 +4334,9 @@ mod tests {
     };
 
     use super::*;
+    use crate::operation::{
+        ApplyCommitsOptions, ConflictPreference, GitOperationKind, MergeOptions,
+    };
     use gpui::TestAppContext;
 
     #[test]
@@ -4380,6 +4613,126 @@ mod tests {
             git_command_output(repo_dir.path(), ["show", ":file.txt"]),
             "head"
         );
+    }
+
+    #[gpui::test]
+    async fn test_preview_and_run_operations(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        let commit_file = |name: &str, contents: &str, message: &str| {
+            fs::write(path.join(name), contents).unwrap();
+            git_command(path, ["add", name]);
+            git_command(path, ["commit", "-m", message]);
+            git_command_output(path, ["rev-parse", "HEAD"])
+        };
+        commit_file("a.txt", "base\n", "base");
+        git_command(path, ["checkout", "-b", "feature"]);
+        let conflicting_commit = commit_file("a.txt", "feature\n", "change a");
+        let clean_commit = commit_file("b.txt", "b\n", "add b");
+        git_command(path, ["checkout", "main"]);
+        commit_file("a.txt", "main\n", "change a on main");
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let run = |operation: GitOperation, cx: &mut TestAppContext| {
+            repository.run_operation(
+                operation,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                Arc::new(test_commit_envs()),
+                cx.to_async(),
+            )
+        };
+
+        let preview = repository
+            .preview_operation(GitOperationPreviewRequest::Merge {
+                source: "feature".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(preview.commit_count, 2);
+        assert!(!preview.can_fast_forward);
+        assert!(!preview.up_to_date);
+        if let Some(conflicted_paths) = preview.conflicted_paths {
+            assert_eq!(conflicted_paths, vec!["a.txt".to_string()]);
+        }
+
+        let preview = repository
+            .preview_operation(GitOperationPreviewRequest::CherryPick {
+                revisions: vec!["HEAD..feature".into()],
+                mainline: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            preview
+                .commits
+                .iter()
+                .map(|commit| commit.sha.to_string())
+                .collect::<Vec<_>>(),
+            vec![conflicting_commit.clone(), clean_commit.clone()]
+        );
+
+        let outcome = run(
+            GitOperation::CherryPick {
+                commits: vec![clean_commit],
+                options: ApplyCommitsOptions::default(),
+            },
+            cx,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.stopped);
+        assert_eq!(fs::read_to_string(path.join("b.txt")).unwrap(), "b\n");
+        assert_eq!(repository.operation_state().await, None);
+
+        let outcome = run(
+            GitOperation::CherryPick {
+                commits: vec![conflicting_commit.clone()],
+                options: ApplyCommitsOptions::default(),
+            },
+            cx,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.stopped);
+        let state = repository.operation_state().await.unwrap();
+        assert_eq!(state.kind, GitOperationKind::CherryPick);
+        assert_eq!(
+            state.current_commit.as_deref(),
+            Some(conflicting_commit.as_str())
+        );
+
+        run(GitOperation::Abort(GitOperationKind::CherryPick), cx)
+            .await
+            .unwrap();
+        assert_eq!(repository.operation_state().await, None);
+        assert_eq!(fs::read_to_string(path.join("a.txt")).unwrap(), "main\n");
+
+        let mut options = MergeOptions::new("feature");
+        options.prefer = Some(ConflictPreference::Theirs);
+        let outcome = run(GitOperation::Merge(options), cx).await.unwrap();
+        assert!(!outcome.stopped);
+        assert_eq!(fs::read_to_string(path.join("a.txt")).unwrap(), "feature\n");
+
+        let preview = repository
+            .preview_operation(GitOperationPreviewRequest::Merge {
+                source: "feature".into(),
+            })
+            .await
+            .unwrap();
+        assert!(preview.up_to_date);
+
+        run(
+            GitOperation::Merge(MergeOptions::new("--upload-pack=x")),
+            cx,
+        )
+        .await
+        .unwrap_err();
     }
 
     #[gpui::test]

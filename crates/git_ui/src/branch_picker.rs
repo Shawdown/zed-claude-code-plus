@@ -28,6 +28,7 @@ use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
 
 use crate::branch_picker;
+use crate::merge_modal::{self, MergeModalMode};
 use git_ui_core::notifications::show_error_toast;
 
 actions!(
@@ -2041,8 +2042,42 @@ impl PickerDelegate for BranchListDelegate {
                     "Delete"
                 };
 
+                let merge_button = selected_branch
+                    .filter(|branch| {
+                        !branch.is_head
+                            && matches!(
+                                self.branch_selection_behavior,
+                                BranchSelectionBehavior::Checkout
+                            )
+                    })
+                    .zip(self.repo.clone())
+                    .map(|(branch, repository)| {
+                        let head_name = merge_modal::head_name(repository.read(cx));
+                        let source = branch.name().to_string();
+                        let workspace = self.workspace.clone();
+                        Button::new("merge-branch", format!("Merge into {head_name}")).on_click(
+                            move |_, window, cx| {
+                                let repository = repository.clone();
+                                let source = source.clone();
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        merge_modal::open_merge_modal(
+                                            workspace,
+                                            Some(repository),
+                                            MergeModalMode::Merge,
+                                            Some(source),
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .log_err();
+                            },
+                        )
+                    });
+
                 let delete_and_select_btns = h_flex()
                     .gap_1()
+                    .children(merge_button)
                     .when(
                         !selected_branch.is_some_and(|branch| branch.is_head),
                         |this| {
