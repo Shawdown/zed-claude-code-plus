@@ -1,7 +1,7 @@
 use std::{rc::Rc, sync::Arc};
 
 use acp_thread::AgentSessionConfigOptions;
-use agent_client_protocol::schema::v2 as acp;
+use agent_client_protocol::v2::schema as acp;
 use agent_servers::AgentServer;
 use agent_settings::AgentSettings;
 
@@ -1330,8 +1330,7 @@ mod tests {
                     agent_server,
                     fs,
                     _refresh_task: Task::ready(()),
-                    _settings_subscription: cx
-                        .observe_global::<SettingsStore>(|_, cx| cx.notify()),
+                    _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
                 })
             });
             let rejected = config_options.defer_next_response();
