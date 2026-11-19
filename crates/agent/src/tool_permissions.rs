@@ -612,6 +612,7 @@ mod tests {
             show_follow_button: true,
             hidden_config_options: Vec::new(),
             show_merge_conflict_indicator: true,
+            auto_generate_thread_titles: true,
             max_idle_retained_threads: 5,
             threads_sidebar: agent_settings::ThreadsSidebarSettings {
                 auto_open: true,

@@ -303,7 +303,9 @@ impl Render for ConfigOptionsView {
             .min_w_0()
             .flex_wrap()
             .gap_1()
-            .children(selectors)
+            // Options read right to left in the order the agent sent them, so the
+            // first one sits next to the send button.
+            .children(selectors.into_iter().rev())
             .into_any_element()
     }
 }
