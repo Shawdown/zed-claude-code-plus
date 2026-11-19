@@ -5288,7 +5288,8 @@ impl GitPanel {
         let state = self.operation_state(cx)?;
         let kind = state.kind;
         let conflict_count = self
-            .change_entries_by_path()
+            .change_entries
+            .iter()
             .filter(|entry| entry.status.is_conflicted())
             .count();
 
