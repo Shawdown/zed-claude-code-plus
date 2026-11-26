@@ -1,5 +1,5 @@
 ### What's new in this release
-- Based on Zed v1.27.0.
+- Based on Zed v1.30.2.
 
 ### Features
 - Edit previous messages for agents that advertise `claudeCodePlus` truncate support (claude-agent-acp-plus 0.94.0-plus.6+).
